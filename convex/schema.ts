@@ -22,6 +22,70 @@ export const priorityValidator = v.union(
   v.literal("low"),
 );
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Agentic AI validators — used by agent tool functions and the orchestrator
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const incidentTypeValidator = v.union(
+  v.literal("medical"),
+  v.literal("fire"),
+  v.literal("security"),
+  v.literal("stampede"),
+  v.literal("infrastructure"),
+  v.literal("other"),
+);
+
+export const verificationStatusValidator = v.union(
+  v.literal("UNVERIFIED"),
+  v.literal("CORROBORATED"),
+  v.literal("VERIFIED"),
+);
+
+export const severityValidator = v.union(
+  v.literal("critical"),
+  v.literal("high"),
+  v.literal("medium"),
+  v.literal("low"),
+);
+
+export const zoneTypeValidator = v.union(
+  v.literal("gate"),
+  v.literal("corridor"),
+  v.literal("open_area"),
+  v.literal("stage"),
+  v.literal("exit"),
+  v.literal("medical_post"),
+  v.literal("other"),
+);
+
+export const responderTypeValidator = v.union(
+  v.literal("security"),
+  v.literal("medical"),
+  v.literal("fire"),
+  v.literal("volunteer"),
+  v.literal("general"),
+);
+
+export const dispatchStatusValidator = v.union(
+  v.literal("pending"),
+  v.literal("accepted"),
+  v.literal("en_route"),
+  v.literal("on_scene"),
+  v.literal("completed"),
+  v.literal("rejected"),
+  v.literal("escalated"),
+);
+
+export const agentNameValidator = v.union(
+  v.literal("intake"),
+  v.literal("verification"),
+  v.literal("crowd_intel"),
+  v.literal("routing"),
+  v.literal("dispatch"),
+  v.literal("orchestrator"),
+  v.literal("safety"),
+);
+
 export default defineSchema({
   // Convex Auth owns `users`, `authAccounts`, `authSessions`, … — extend, never duplicate.
   ...authTables,
@@ -64,6 +128,7 @@ export default defineSchema({
     // event. Optional: memberships written before this field existed have none
     // and sort after every membership that has one.
     lastOpenedAt: v.optional(v.number()),
+    responderRegistered: v.optional(v.boolean()),
   })
     .index("by_event_user", ["eventId", "userId"])
     .index("by_event_role", ["eventId", "role"])
@@ -88,6 +153,8 @@ export default defineSchema({
     reviewedBy: v.optional(v.id("users")),
     reviewedAt: v.optional(v.number()),
     clientId: v.string(),
+    imageStorageId: v.optional(v.id("_storage")),
+    imageUrl: v.optional(v.string()),
     createdAt: v.number(),
   })
     .index("by_event_created", ["eventId", "createdAt"])
@@ -103,4 +170,247 @@ export default defineSchema({
     createdBy: v.id("users"),
     createdAt: v.number(),
   }).index("by_event", ["eventId"]),
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // AGENTIC AI TABLES — Multi-agent incident response system
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Master incidents — deduplicated from individual reports by the Intake
+   * Agent. One incident may have many contributing reports linked via the
+   * incidentReports join table.
+   */
+  incidents: defineTable({
+    eventId: v.id("events"),
+    /** Human-readable code like "INC-001". */
+    incidentCode: v.string(),
+    /** Merged description from all contributing reports. */
+    description: v.string(),
+    location: v.string(),
+    pinX: v.number(),
+    pinY: v.number(),
+    incidentType: incidentTypeValidator,
+    /** Verification lifecycle: UNVERIFIED → CORROBORATED → VERIFIED. */
+    verificationStatus: verificationStatusValidator,
+    verificationReason: v.optional(v.string()),
+    severity: severityValidator,
+    /** Count of truly independent reporters (not copies). */
+    independentSourceCount: v.number(),
+    staffVerificationRequested: v.boolean(),
+    staffVerifiedBy: v.optional(v.id("users")),
+    staffVerifiedAt: v.optional(v.number()),
+    isResolved: v.boolean(),
+    resolvedAt: v.optional(v.number()),
+    resolvedBy: v.optional(v.id("users")),
+    hasImageEvidence: v.optional(v.boolean()),
+    imageStorageId: v.optional(v.id("_storage")),
+    imageUrl: v.optional(v.string()),
+    imageAnalysis: v.optional(v.string()),
+    imageConfidence: v.optional(v.number()),
+    averageTrustScore: v.optional(v.number()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_event_created", ["eventId", "createdAt"])
+    .index("by_event_status", ["eventId", "verificationStatus"])
+    .index("by_incidentCode", ["incidentCode"]),
+
+  /**
+   * Join table linking incidents to their contributing reports. Lets us
+   * trace every report back to the master incident it was merged into.
+   */
+  incidentReports: defineTable({
+    incidentId: v.id("incidents"),
+    reportId: v.id("reports"),
+    /** True for the report that originally created this incident. */
+    isOriginal: v.boolean(),
+    /** Similarity score from deduplication matching (0-1). */
+    similarityScore: v.number(),
+    addedAt: v.number(),
+  })
+    .index("by_incident", ["incidentId"])
+    .index("by_report", ["reportId"]),
+
+  /**
+   * Venue zones with live crowd data. The Crowd Intelligence Agent reads
+   * and writes occupancy, flow rates, and risk scores here.
+   */
+  zones: defineTable({
+    eventId: v.id("events"),
+    name: v.string(),
+    /** Zone centre for display on the map (percentage 0-100). */
+    pinX: v.number(),
+    pinY: v.number(),
+    capacity: v.number(),
+    currentOccupancy: v.number(),
+    /** People per minute entering / leaving the zone. */
+    inflowRate: v.number(),
+    outflowRate: v.number(),
+    /** Composite risk score computed by the Crowd Intelligence Agent (0-100). */
+    riskScore: v.number(),
+    /** JSON string listing the top risk contributors. */
+    riskFactors: v.optional(v.string()),
+    zoneType: zoneTypeValidator,
+    exitBlocked: v.boolean(),
+    isNarrowPassage: v.boolean(),
+    updatedAt: v.number(),
+  })
+    .index("by_event", ["eventId"])
+    .index("by_event_risk", ["eventId", "riskScore"]),
+
+  /**
+   * Edges of the venue graph. Nodes are zones; edges carry dynamic weights
+   * that the Routing Agent updates based on congestion and risk.
+   */
+  venueEdges: defineTable({
+    eventId: v.id("events"),
+    fromZoneId: v.id("zones"),
+    toZoneId: v.id("zones"),
+    /** Walking time in seconds under uncongested conditions. */
+    baseWeight: v.number(),
+    /** Current weight after factoring congestion + risk. */
+    currentWeight: v.number(),
+    /** People the corridor can move per minute. */
+    corridorCapacity: v.number(),
+    isPassable: v.boolean(),
+    updatedAt: v.number(),
+  })
+    .index("by_event", ["eventId"])
+    .index("by_from", ["fromZoneId"]),
+
+  /**
+   * Route recommendations generated by the Routing Agent. Evacuation
+   * routes require control-room approval before public broadcast.
+   */
+  routeRecommendations: defineTable({
+    eventId: v.id("events"),
+    incidentId: v.optional(v.id("incidents")),
+    affectedZoneId: v.id("zones"),
+    /** JSON array of zone IDs forming the path. */
+    routePath: v.string(),
+    /** Human-readable guidance text. */
+    instruction: v.string(),
+    isEvacuation: v.boolean(),
+    requiresApproval: v.boolean(),
+    approvedBy: v.optional(v.id("users")),
+    approvedAt: v.optional(v.number()),
+    isActive: v.boolean(),
+    createdAt: v.number(),
+  })
+    .index("by_event_active", ["eventId", "isActive"])
+    .index("by_incident", ["incidentId"]),
+
+  /**
+   * Responder profiles — staff who have been registered for dispatch.
+   * Position is zone-based; precise pinX/pinY is for the demo map.
+   */
+  responders: defineTable({
+    eventId: v.id("events"),
+    userId: v.id("users"),
+    membershipId: v.id("memberships"),
+    responderType: responderTypeValidator,
+    currentZoneId: v.optional(v.id("zones")),
+    /** Simulated precise map position for the demo overlay. */
+    posX: v.optional(v.number()),
+    posY: v.optional(v.number()),
+    isAvailable: v.boolean(),
+    currentTaskId: v.optional(v.id("dispatchTasks")),
+    hasFirstAid: v.boolean(),
+    hasFireTraining: v.boolean(),
+    /** Display name cached from the user doc for quick reads. */
+    name: v.optional(v.string()),
+    updatedAt: v.number(),
+  })
+    .index("by_event", ["eventId"])
+    .index("by_event_available", ["eventId", "isAvailable"])
+    .index("by_user_event", ["userId", "eventId"]),
+
+  /**
+   * Dispatch tasks assigned to responders by Agent 5. Tracks the full
+   * lifecycle from assignment through arrival to completion or escalation.
+   */
+  dispatchTasks: defineTable({
+    eventId: v.id("events"),
+    incidentId: v.id("incidents"),
+    responderId: v.id("responders"),
+    instruction: v.string(),
+    status: dispatchStatusValidator,
+    estimatedEta: v.optional(v.number()),
+    distanceMeters: v.optional(v.number()),
+    assignedAt: v.number(),
+    acceptedAt: v.optional(v.number()),
+    completedAt: v.optional(v.number()),
+    escalatedToTaskId: v.optional(v.id("dispatchTasks")),
+    isEmergencyDispatch: v.boolean(),
+    emergencyService: v.optional(v.union(
+      v.literal("ambulance"),
+      v.literal("fire_brigade"),
+      v.literal("police"),
+    )),
+  })
+    .index("by_event", ["eventId"])
+    .index("by_incident", ["incidentId"])
+    .index("by_responder_status", ["responderId", "status"]),
+
+  /**
+   * Audit log of every agent tool call, state change, and safety decision.
+   * The live-log dashboard reads this table with a reactive query.
+   */
+  agentLogs: defineTable({
+    eventId: v.id("events"),
+    agentName: agentNameValidator,
+    toolName: v.string(),
+    inputSummary: v.string(),
+    outputSummary: v.string(),
+    level: v.union(
+      v.literal("info"),
+      v.literal("warn"),
+      v.literal("error"),
+      v.literal("action"),
+    ),
+    incidentId: v.optional(v.id("incidents")),
+    createdAt: v.number(),
+  })
+    .index("by_event_created", ["eventId", "createdAt"])
+    .index("by_event_agent", ["eventId", "agentName"]),
+
+  /**
+   * Real-time tracker for individual agent pipeline executions.
+   * Powers the visible step-by-step showcase for hackathons and control room displays.
+   */
+  pipelineRuns: defineTable({
+    eventId: v.id("events"),
+    incidentId: v.optional(v.id("incidents")),
+    reportId: v.id("reports"),
+    runCode: v.string(),
+    activeAgent: v.union(
+      v.literal("intake"),
+      v.literal("verification"),
+      v.literal("crowd_intel"),
+      v.literal("routing"),
+      v.literal("dispatch"),
+      v.literal("completed"),
+    ),
+    agentPhase: v.union(
+      v.literal("starting"),
+      v.literal("thinking"),
+      v.literal("tool_call"),
+      v.literal("deciding"),
+      v.literal("output"),
+      v.literal("handoff"),
+    ),
+    currentThought: v.string(),
+    currentTool: v.optional(v.string()),
+    agentReasoning: v.optional(v.string()),
+    agentTimestamps: v.string(), // JSON: Record<agentName, {startedAt, completedAt}>
+    status: v.union(
+      v.literal("running"),
+      v.literal("completed"),
+      v.literal("failed"),
+    ),
+    startedAt: v.number(),
+    completedAt: v.optional(v.number()),
+  })
+    .index("by_event_status", ["eventId", "status"])
+    .index("by_event_startedAt", ["eventId", "startedAt"]),
 });

@@ -12,6 +12,7 @@ import campusMap from "@/imports/iitd-campus-map.jpg.jpeg";
 // 665x595, opaque, background exactly the `cream` token so it sits flush on
 // the login screen.
 import landingIllustration from "@/assets/landing-illustration.png";
+import { AgentCommandCenter } from "./AgentCommandCenter";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -19,7 +20,7 @@ import landingIllustration from "@/assets/landing-illustration.png";
 type Screen = "login" | "home" | "my-events" | "create-1" | "create-2" | "create-3" | "create-done" | "join-scan" | "staff-code" | "app" | "staff-app";
 type Role = "organizer" | "attendee" | "staff";
 type Tab = "map" | "feed" | "info" | "you";
-type StaffTab = "map" | "poi" | "reports" | "feed" | "you";
+type StaffTab = "map" | "command" | "poi" | "reports" | "feed" | "you";
 type Priority = "critical" | "high" | "medium" | "low";
 
 interface POI { id: string; x: number; y: number; emoji: string; label: string; }
@@ -533,6 +534,7 @@ function NotificationPanel({ notifications, onClose, onDismiss }: { notification
 function PannableMap({
   pins, onPin, approvedReports, pendingReports = [], headerContent, belowMapContent, allowPin, pois = [],
   onReportPinTap, pinpointMode, notifCount = 0, onNotifOpen, onPinpointToggle, mapUrl = null,
+  zones = [], responders = [],
 }: {
   mapUrl?: string | null;
   pins: Pin[];
@@ -549,6 +551,8 @@ function PannableMap({
   notifCount?: number;
   onNotifOpen?: () => void;
   onPinpointToggle?: () => void;
+  zones?: Array<{ _id: string; name: string; pinX: number; pinY: number; riskScore: number; currentOccupancy: number; capacity: number }>;
+  responders?: Array<{ _id: string; name?: string; posX?: number; posY?: number; responderType: string; isAvailable: boolean }>;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [offset, setOffset] = useState({ x: 0, y: 0 });
@@ -768,6 +772,58 @@ function PannableMap({
               </div>
             </div>
           ))}
+
+          {/* AI Crowd Intelligence Zone Risk Heatmap Badges */}
+          {zones.map((z) => {
+            const isHigh = z.riskScore > 60;
+            const isMedium = z.riskScore > 30 && z.riskScore <= 60;
+            const badgeBg = isHigh ? "rgba(220,38,38,0.9)" : isMedium ? "rgba(234,88,12,0.85)" : "rgba(22,163,74,0.8)";
+            return (
+              <div key={z._id} className="absolute pointer-events-none"
+                style={{
+                  left: `${z.pinX}%`, top: `${z.pinY}%`,
+                  transform: `translate(-50%, -50%) scale(${1 / scale})`,
+                  transformOrigin: "50% 50%",
+                }}>
+                <div className="flex flex-col items-center">
+                  <div className="flex items-center gap-1 px-2 py-0.5 rounded-full shadow-md text-[10px] font-bold text-white whitespace-nowrap"
+                    style={{ background: badgeBg, border: "1.5px solid white", backdropFilter: "blur(4px)" }}>
+                    <span>{z.name}</span>
+                    <span className="opacity-90">{z.riskScore}%</span>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+
+          {/* Emergency Responder Markers */}
+          {responders.map((resp) => {
+            if (resp.posX === undefined || resp.posY === undefined) return null;
+            const respColor =
+              resp.responderType === "medical"
+                ? "#dc2626"
+                : resp.responderType === "fire"
+                ? "#ea580c"
+                : resp.responderType === "security"
+                ? "#2563eb"
+                : "#16a34a";
+            return (
+              <div key={resp._id} className="absolute pointer-events-none"
+                style={{
+                  left: `${resp.posX}%`, top: `${resp.posY}%`,
+                  transform: `translate(-50%, -50%) scale(${1 / scale})`,
+                  transformOrigin: "50% 50%",
+                }}>
+                <div
+                  className="w-6 h-6 rounded-full flex items-center justify-center shadow-lg text-[10px] text-white font-bold"
+                  style={{ background: respColor, border: "2px solid white" }}
+                  title={resp.name ?? resp.responderType}
+                >
+                  {resp.responderType === "medical" ? "✚" : resp.responderType === "fire" ? "🔥" : "🛡"}
+                </div>
+              </div>
+            );
+          })}
         </div>
 
         {/* Gradient */}
@@ -849,7 +905,7 @@ function FramedMap(props: React.ComponentProps<typeof PannableMap>) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Login
 // ─────────────────────────────────────────────────────────────────────────────
-function LoginScreen({ onLogin }: { onLogin: () => Promise<unknown> }) {
+function LoginScreen({ onLogin, onGuestLogin }: { onLogin: () => Promise<unknown>; onGuestLogin?: () => Promise<unknown> }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -906,6 +962,26 @@ function LoginScreen({ onLogin }: { onLogin: () => Promise<unknown> }) {
           </span>
           Continue with Google
         </button>
+        {onGuestLogin && (
+          <button
+            onClick={async () => {
+              setBusy(true);
+              setError(null);
+              try {
+                await onGuestLogin();
+              } catch (err) {
+                setError(errorMessage(err));
+                setBusy(false);
+              }
+            }}
+            disabled={busy}
+            className="w-full flex items-center justify-center gap-2 py-[15px] rounded-2xl font-semibold text-sm transition-transform active:scale-[0.98]"
+            style={{ background: "rgba(255,255,255,0.9)", border: `1.5px solid ${border}`, color: ink, opacity: busy ? 0.4 : 1, cursor: busy ? "not-allowed" : "pointer" }}
+          >
+            <span>⚡</span>
+            <span>Instant Demo Sign In</span>
+          </button>
+        )}
         {error && <p className="text-xs text-center" style={{ color: "#dc2626" }}>{error}</p>}
       </div>
       <div className="flex-1" />
@@ -2532,17 +2608,57 @@ function StaffReportsView({ reports, onApprove, onReject, onBan, onSetPriority, 
 // ─────────────────────────────────────────────────────────────────────────────
 // Report Modal — description only
 // ─────────────────────────────────────────────────────────────────────────────
-function ReportModal({ onClose, onSubmit, pin }: { onClose: () => void; onSubmit: (desc: string, loc: string) => Promise<string | null>; pin: Pin | null }) {
+function ReportModal({
+  onClose,
+  onSubmit,
+  pin,
+}: {
+  onClose: () => void;
+  onSubmit: (desc: string, loc: string, storageId?: Id<"_storage">, imgUrl?: string) => Promise<string | null>;
+  pin: Pin | null;
+}) {
   const [description, setDescription] = useState("");
   const [submitted, setSubmitted] = useState(false);
   const [failure, setFailure] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [photoUrl, setPhotoUrl] = useState<string | null>(null);
+  const [photoStorageId, setPhotoStorageId] = useState<Id<"_storage"> | undefined>(undefined);
+  const [uploading, setUploading] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const generateUploadUrl = useMutation(api.files.generateUploadUrl);
   const location = pin ? inferLocation(pin.x, pin.y) : "Pinned Location";
 
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      setUploading(true);
+      const postUrl = await generateUploadUrl();
+      const res = await fetch(postUrl, {
+        method: "POST",
+        headers: { "Content-Type": file.type },
+        body: file,
+      });
+      const { storageId } = await res.json();
+      setPhotoStorageId(storageId);
+      setPhotoUrl(URL.createObjectURL(file));
+    } catch (err: any) {
+      alert("Failed to upload image: " + err.message);
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  const handleApplyPreset = (presetDesc: string, presetImg: string) => {
+    setDescription(presetDesc);
+    setPhotoUrl(presetImg);
+    setPhotoStorageId(undefined);
+  };
+
   const submit = async () => {
-    if (!description.trim() || busy) return;
+    if (!description.trim() || busy || uploading) return;
     setBusy(true);
-    const failed = await onSubmit(description, location);
+    const failed = await onSubmit(description, location, photoStorageId, photoUrl ?? undefined);
     setBusy(false);
     if (failed) { setFailure(failed); setSubmitted(true); return; }
     setSubmitted(true);
@@ -2550,8 +2666,8 @@ function ReportModal({ onClose, onSubmit, pin }: { onClose: () => void; onSubmit
   };
 
   return (
-    <div className="absolute inset-0 z-50 flex items-end sm:items-center sm:justify-center" style={{ background: "rgba(26,25,23,0.45)", backdropFilter: "blur(6px)" }} onClick={onClose}>
-      <div className="w-full p-6 pb-8 rounded-t-[28px] sm:rounded-[28px] sm:max-w-[480px]" style={{ background: "#faf8f5", border: `1px solid ${border}` }} onClick={(e) => e.stopPropagation()}>
+    <div className="absolute inset-0 z-50 flex items-end sm:items-center sm:justify-center" style={{ background: "rgba(26,25,23,0.55)", backdropFilter: "blur(6px)" }} onClick={onClose}>
+      <div className="w-full p-6 pb-8 rounded-t-[28px] sm:rounded-[28px] sm:max-w-[500px] max-h-[90vh] overflow-y-auto" style={{ background: "#faf8f5", border: `1px solid ${border}` }} onClick={(e) => e.stopPropagation()}>
         {submitted ? (
           <div className="flex flex-col items-center gap-3 py-6">
             <div className="w-14 h-14 rounded-full flex items-center justify-center" style={{ background: failure ? "rgba(220,38,38,0.1)" : "#dcfce7" }}>
@@ -2561,23 +2677,124 @@ function ReportModal({ onClose, onSubmit, pin }: { onClose: () => void; onSubmit
                 <svg width="24" height="24" viewBox="0 0 24 24" fill="none"><path d="M5 12l5 5L20 7" stroke="#16a34a" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" /></svg>
               )}
             </div>
-            <p className="font-bold text-lg" style={{ color: ink }}>{failure ? "Not Submitted" : "Report Submitted"}</p>
-            <p className="text-sm text-center" style={{ color: failure ? "#dc2626" : muted }}>{failure ?? "A staff member will review it shortly."}</p>
+            <p className="font-bold text-lg" style={{ color: ink }}>{failure ? "Not Submitted" : "Incident Filed & Queued for AI Triage"}</p>
+            <p className="text-sm text-center" style={{ color: failure ? "#dc2626" : muted }}>
+              {failure ?? "AI Agents are analyzing the description, photo evidence & reporter trust score."}
+            </p>
           </div>
         ) : (
           <>
-            <div className="flex items-center justify-between mb-4">
-              <p className="font-bold text-lg" style={{ color: ink }}>Report an Issue</p>
-              <button onClick={onClose} className="w-8 h-8 rounded-full flex items-center justify-center text-sm" style={{ background: "#edeae4", color: "#6b6456" }}>✕</button>
+            <div className="flex items-center justify-between mb-3">
+              <div>
+                <p className="font-bold text-lg" style={{ color: ink }}>Report an Incident</p>
+                <p className="text-xs text-slate-500">📍 Pinned at {location}</p>
+              </div>
+              <button onClick={onClose} className="w-8 h-8 rounded-full flex items-center justify-center text-sm cursor-pointer" style={{ background: "#edeae4", color: "#6b6456" }}>✕</button>
             </div>
-            <textarea value={description} onChange={(e) => setDescription(e.target.value)}
-              placeholder="Describe the issue briefly…" rows={5}
-              className="w-full rounded-xl px-3 py-3 text-sm outline-none resize-none mb-3"
+
+            {/* Reporter Credibility / Trust Score Banner */}
+            <div className="mb-3 p-2.5 rounded-xl flex items-center justify-between" style={{ background: "#f0ece4", border: `1px solid ${border}` }}>
+              <div className="flex items-center gap-2">
+                <span className="text-base">🛡️</span>
+                <div>
+                  <span className="text-[11px] font-bold text-slate-700 block">Reporter Credibility Score: 85/100</span>
+                  <span className="text-[10px] text-slate-500">High trust rating · Eligible for rapid agent corroboration</span>
+                </div>
+              </div>
+              <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800 border border-emerald-300">
+                TRUSTED
+              </span>
+            </div>
+
+            {/* Quick Demo Incident Presets */}
+            <div className="mb-3">
+              <span className="text-[11px] font-bold text-slate-600 block mb-1.5">⚡ 1-Click Demo Presets (with photo):</span>
+              <div className="grid grid-cols-2 gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => handleApplyPreset("Massive crowd surge bottleneck at Gate 3 turnstiles, people unable to move!", "https://images.unsplash.com/photo-1540039155733-5bb30b53aa14?w=600&auto=format&fit=crop&q=80")}
+                  className="p-1.5 rounded-lg text-left text-[11px] font-medium border border-slate-300 bg-white hover:bg-slate-50 transition cursor-pointer flex items-center gap-1.5"
+                >
+                  <span>⚠️ Gate 3 Crowd</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleApplyPreset("Medical emergency near food court! Patron collapsed, needs first aid immediately.", "https://images.unsplash.com/photo-1584515979956-d9f6e5d09982?w=600&auto=format&fit=crop&q=80")}
+                  className="p-1.5 rounded-lg text-left text-[11px] font-medium border border-slate-300 bg-white hover:bg-slate-50 transition cursor-pointer flex items-center gap-1.5"
+                >
+                  <span>🚑 Medical Collapsed</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleApplyPreset("Dense smoke coming from electrical board near corridor partition!", "https://images.unsplash.com/photo-1542385151-efd9000785a0?w=600&auto=format&fit=crop&q=80")}
+                  className="p-1.5 rounded-lg text-left text-[11px] font-medium border border-slate-300 bg-white hover:bg-slate-50 transition cursor-pointer flex items-center gap-1.5"
+                >
+                  <span>🔥 Smoke Hazard</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleApplyPreset("Metal barricade collapsed under crowd weight! Multiple people tripped.", "https://images.unsplash.com/photo-1584438784894-089d6a62b8fa?w=600&auto=format&fit=crop&q=80")}
+                  className="p-1.5 rounded-lg text-left text-[11px] font-medium border border-slate-300 bg-white hover:bg-slate-50 transition cursor-pointer flex items-center gap-1.5"
+                >
+                  <span>🚧 Barrier Collapse</span>
+                </button>
+              </div>
+            </div>
+
+            <textarea
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+              placeholder="Describe the issue in detail (e.g., Gate 3 overcrowding, person hurt, fire/smoke)…"
+              rows={3}
+              className="w-full rounded-xl px-3 py-2.5 text-sm outline-none resize-none mb-2.5"
               style={{ background: "#edeae4", border: `1px solid ${border}`, color: ink, fontFamily: "'Outfit', sans-serif" }}
-              autoFocus />
-            <button onClick={() => { void submit(); }} disabled={!description.trim() || busy} className="w-full py-4 rounded-2xl font-semibold text-sm text-white"
-              style={{ background: accent, opacity: description.trim() && !busy ? 1 : 0.4, cursor: description.trim() && !busy ? "pointer" : "not-allowed" }}>
-              Submit Report
+              autoFocus
+            />
+
+            {/* Photo Upload Dropzone / Preview */}
+            <div className="mb-3">
+              <input
+                type="file"
+                ref={fileInputRef}
+                accept="image/*"
+                onChange={handleFileUpload}
+                className="hidden"
+              />
+
+              {photoUrl ? (
+                <div className="relative rounded-xl overflow-hidden border border-slate-300 bg-slate-900">
+                  <img src={photoUrl} alt="Incident Attachment" className="w-full h-32 object-cover" />
+                  <div className="absolute bottom-2 left-2 px-2 py-0.5 rounded bg-black/80 text-white text-[10px] font-mono flex items-center gap-1">
+                    <span>✨ AI Vision Pre-Scan Ready</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => { setPhotoUrl(null); setPhotoStorageId(undefined); }}
+                    className="absolute top-2 right-2 w-6 h-6 rounded-full bg-black/70 text-white flex items-center justify-center text-xs hover:bg-black cursor-pointer"
+                  >
+                    ✕
+                  </button>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={uploading}
+                  className="w-full py-2.5 px-3 rounded-xl border border-dashed border-slate-400 bg-white hover:bg-slate-50 flex items-center justify-center gap-2 text-xs text-slate-700 transition cursor-pointer"
+                >
+                  <span>📷</span>
+                  <span>{uploading ? "Uploading Photo..." : "Attach Incident Photo (Camera / File)"}</span>
+                </button>
+              )}
+            </div>
+
+            <button
+              onClick={() => { void submit(); }}
+              disabled={!description.trim() || busy || uploading}
+              className="w-full py-3.5 rounded-2xl font-bold text-sm text-white transition active:scale-98 cursor-pointer flex items-center justify-center gap-2"
+              style={{ background: accent, opacity: description.trim() && !busy && !uploading ? 1 : 0.5 }}
+            >
+              <span>Submit Report for Multi-Agent Response</span>
             </button>
           </>
         )}
@@ -2721,6 +2938,7 @@ const attendeeNav = [
 
 const staffNav = [
   { id: "map" as StaffTab, label: "Map", icon: (a: boolean) => mkIcon(a, "#10b981", <><path d="M9 2L3 5.5v14l6-3.5 8 3.5 6-3.5v-14l-6 3.5-8-3.5z" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" fill={a ? "rgba(16,185,129,0.1)" : "none"} /><path d="M9 2v14.5M17 6v14" stroke="currentColor" strokeWidth="1.5" /></>) },
+  { id: "command" as StaffTab, label: "Command", icon: (a: boolean) => mkIcon(a, "#10b981", <><circle cx="11" cy="11" r="7.5" stroke="currentColor" strokeWidth="1.5" fill={a ? "rgba(16,185,129,0.15)" : "none"} /><circle cx="11" cy="11" r="2.5" fill="currentColor" /><path d="M11 3.5v2M11 16.5v2M3.5 11h2M16.5 11h2" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" /></>) },
   { id: "poi" as StaffTab, label: "POI", icon: (a: boolean) => mkIcon(a, "#10b981", <><circle cx="11" cy="9" r="4" stroke="currentColor" strokeWidth="1.5" fill={a ? "rgba(16,185,129,0.1)" : "none"} /><path d="M11 13v6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" /><path d="M8 19h6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" /></>) },
   { id: "reports" as StaffTab, label: "Reports", icon: (a: boolean) => mkIcon(a, "#10b981", <><path d="M11 3L3 18h16L11 3z" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" fill={a ? "rgba(16,185,129,0.1)" : "none"} /><path d="M11 9v4M11 15.5v.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" /></>) },
   { id: "feed" as StaffTab, label: "Feed", icon: (a: boolean) => mkIcon(a, "#10b981", <><rect x="3" y="5" width="16" height="3" rx="1.5" fill="currentColor" /><rect x="3" y="10.5" width="11" height="2.5" rx="1.25" fill="currentColor" opacity={a ? 0.7 : 1} /><rect x="3" y="16" width="8" height="2.5" rx="1.25" fill="currentColor" opacity={a ? 0.4 : 0.7} /></>) },
@@ -2736,7 +2954,7 @@ export default function App() {
   // "skip" while signed out — an authenticated query fired during sign-out throws
   // Unauthenticated and white-screens the app.
   const viewer = useQuery(api.users.viewer, isAuthenticated ? {} : "skip");
-  const userName = viewer?.name ?? viewer?.email ?? "";
+  const userName = viewer?.name ?? viewer?.email ?? "Demo User";
 
   // ── Session restore ────────────────────────────────────────────────────────
   // The active event is DERIVED from the server on every render. It is never
@@ -2761,6 +2979,8 @@ export default function App() {
   const reportRows = useQuery(api.reports.listForEvent, activeEventId ? { eventId: activeEventId } : "skip");
   const staffReportRows = useQuery(api.reports.listForStaff, activeEventId && isModerator ? { eventId: activeEventId } : "skip");
   const poiRows = useQuery(api.mapPins.listForEvent, activeEventId ? { eventId: activeEventId } : "skip");
+  const liveZones = useQuery(api.agents.queries.listZonesWithRisk, activeEventId && isModerator ? { eventId: activeEventId } : "skip");
+  const liveResponders = useQuery(api.agents.queries.listResponders, activeEventId && isModerator ? { eventId: activeEventId } : "skip");
 
   const createEventMutation = useMutation(api.events.create);
   const updateFloorMapMutation = useMutation(api.events.updateFloorMap);
@@ -3065,7 +3285,11 @@ export default function App() {
   };
 
   /** Returns an error message, or null when the report was filed. */
-  const handleReport = async (desc: string): Promise<string | null> => {
+  const handleReport = async (
+    desc: string,
+    storageId?: Id<"_storage">,
+    imgUrl?: string,
+  ): Promise<string | null> => {
     if (!activeEventId) return "You are not in an event.";
     const pin = pins[0];
     if (!pin) return "Place a pin on the map first.";
@@ -3078,6 +3302,8 @@ export default function App() {
         description: desc,
         pinX: pin.x,
         pinY: pin.y,
+        imageStorageId: storageId,
+        imageUrl: imgUrl,
       });
       setPins([]);
       setPinpointMode(false);
@@ -3127,7 +3353,7 @@ export default function App() {
     if ((screen === "app" || screen === "staff-app") && eventLoading) return <SplashScreen />;
     switch (screen) {
       case "login":
-        return <LoginScreen onLogin={() => signIn("google")} />;
+        return <LoginScreen onLogin={() => signIn("google")} onGuestLogin={() => signIn("anonymous")} />;
 
       case "home":
         return <HomeScreen userName={userName} error={homeError}
@@ -3278,7 +3504,17 @@ export default function App() {
                 error={actionError}
               />
             </aside>
-            {showReport && <ReportModal onClose={() => { setShowReport(false); setPins([]); setPinpointMode(false); }} onSubmit={(desc) => handleReport(desc)} pin={pins[0] ?? null} />}
+            {showReport && (
+              <ReportModal
+                onClose={() => {
+                  setShowReport(false);
+                  setPins([]);
+                  setPinpointMode(false);
+                }}
+                onSubmit={(desc, _loc, sId, iUrl) => handleReport(desc, sId, iUrl)}
+                pin={pins[0] ?? null}
+              />
+            )}
             {showLeave && <LeaveModal onConfirm={() => { void handleLeave(); }} onCancel={() => setShowLeave(false)} isOrganizer={role === "organizer"} />}
             {selectedReport && (
               <ReportPinDetailSheet report={selectedReport} onClose={() => setSelectedReportId(null)} />
@@ -3299,9 +3535,15 @@ export default function App() {
           // reports queue.
           <div className="flex-1 flex flex-col min-h-0 relative lg:flex-row lg:gap-6 lg:p-6">
             <SideNav items={staffNav.filter((i) => i.id !== "reports")} active={staffTab} onChange={setStaffTab} />
-            <div className="flex-1 flex flex-col min-h-0 relative sm:p-6 lg:p-0 lg:flex-none lg:aspect-[390/811.5]">
+            <div className={`flex-1 flex flex-col min-h-0 relative sm:p-6 lg:p-0 ${staffTab === "command" ? "lg:flex-1" : "lg:flex-none lg:aspect-[390/811.5]"}`}>
+            {staffTab === "command" && (
+              <div className="flex-1 flex flex-col min-h-0 w-full lg:rounded-[28px] lg:overflow-hidden lg:shadow-[0_0_0_1px_rgba(0,0,0,0.12),0_40px_80px_rgba(0,0,0,0.25)]">
+                <AgentCommandCenter eventId={activeEventId!} role={role} mapUrl={mapUrl} onSwitchToMap={() => setStaffTab("map")} />
+              </div>
+            )}
             {staffTab === "map" && (
               <FramedMap mapUrl={mapUrl} pins={pins} onPin={(p) => { if (staffPinpointMode) setPins([p]); }} approvedReports={approvedReports} pendingReports={pendingReviewReports} allowPin={staffPinpointMode} pois={pois}
+                zones={liveZones ?? []} responders={liveResponders ?? []}
                 pinpointMode={staffPinpointMode}
                 onPinpointToggle={() => { setStaffPinpointMode((v) => !v); setPins([]); }}
                 onReportPinTap={(id) => { setSelectedReportId(id); }}
@@ -3461,19 +3703,30 @@ export default function App() {
               <IslandNav items={staffNav} active={staffTab} onChange={setStaffTab} />
             </div>
             </div>
-            {/* Laptop right panel: the reports queue, always visible. */}
-            <aside className="hidden lg:flex lg:flex-col lg:flex-1 lg:min-w-0 lg:max-w-[720px] lg:min-h-0 lg:rounded-[28px] lg:overflow-hidden lg:bg-[#f5f1ea] lg:shadow-[0_0_0_1px_rgba(0,0,0,0.12),0_40px_80px_rgba(0,0,0,0.25)]">
-              <StaffReportsView
-                reports={staffReports}
-                onApprove={handleApprove}
-                onReject={handleReject}
-                onBan={handleBan}
-                onSetPriority={handleSetPriority}
-                onSetCritical={handleSetCritical}
-                error={actionError}
+            {/* Laptop right panel: the reports queue, always visible (except when AI command center is full-width). */}
+            {staffTab !== "command" && (
+              <aside className="hidden lg:flex lg:flex-col lg:flex-1 lg:min-w-0 lg:max-w-[720px] lg:min-h-0 lg:rounded-[28px] lg:overflow-hidden lg:bg-[#f5f1ea] lg:shadow-[0_0_0_1px_rgba(0,0,0,0.12),0_40px_80px_rgba(0,0,0,0.25)]">
+                <StaffReportsView
+                  reports={staffReports}
+                  onApprove={handleApprove}
+                  onReject={handleReject}
+                  onBan={handleBan}
+                  onSetPriority={handleSetPriority}
+                  onSetCritical={handleSetCritical}
+                  error={actionError}
+                />
+              </aside>
+            )}
+            {showReport && (
+              <ReportModal
+                onClose={() => {
+                  setShowReport(false);
+                  setPins([]);
+                }}
+                onSubmit={(desc, _loc, sId, iUrl) => handleReport(desc, sId, iUrl)}
+                pin={pins[0] ?? null}
               />
-            </aside>
-            {showReport && <ReportModal onClose={() => { setShowReport(false); setPins([]); }} onSubmit={(desc) => handleReport(desc)} pin={pins[0] ?? null} />}
+            )}
             {showLeave && <LeaveModal onConfirm={() => { void handleLeave(); }} onCancel={() => setShowLeave(false)} isOrganizer={role === "organizer"} />}
             {selectedReport && (
               <ReportPinDetailSheet report={selectedReport} onClose={() => setSelectedReportId(null)}

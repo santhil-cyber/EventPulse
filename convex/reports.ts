@@ -1,4 +1,5 @@
 import { v } from "convex/values";
+import { internal } from "./_generated/api";
 import type { Doc, Id } from "./_generated/dataModel";
 import { mutation, query, type MutationCtx, type QueryCtx } from "./_generated/server";
 import { requireMembership, requireRole } from "./lib/authz";
@@ -77,6 +78,8 @@ function shape(report: Doc<"reports">, who: { name: string; trustScore: number; 
     pinY: report.pinY,
     views: report.views,
     officialStatement: report.officialStatement,
+    imageStorageId: report.imageStorageId,
+    imageUrl: report.imageUrl,
     isMine: report.reporterId === callerId,
     reviewedByMe: report.reviewedBy === callerId,
     reviewedAt: report.reviewedAt,
@@ -97,6 +100,8 @@ export const create = mutation({
     description: v.string(),
     pinX: v.number(),
     pinY: v.number(),
+    imageStorageId: v.optional(v.id("_storage")),
+    imageUrl: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
     const membership = await requireMembership(ctx, args.eventId);
@@ -112,6 +117,21 @@ export const create = mutation({
         throw new Error("That report id is already in use.");
       }
       return existing._id;
+    }
+
+    // Rate Limiting & Abuse Prevention (Section 9.7)
+    // Prevent flooding: maximum 6 reports per user in any 60-second window
+    const oneMinuteAgo = Date.now() - 60 * 1000;
+    const recentUserReports = await ctx.db
+      .query("reports")
+      .withIndex("by_event_created", (q) =>
+        q.eq("eventId", args.eventId).gte("createdAt", oneMinuteAgo),
+      )
+      .filter((q) => q.eq(q.field("reporterId"), membership.userId))
+      .take(7);
+
+    if (recentUserReports.length >= 6) {
+      throw new Error("Report rate limit exceeded. Please wait a minute before submitting further reports.");
     }
 
     const description = args.description.trim();
@@ -133,7 +153,7 @@ export const create = mutation({
     const autoApprove =
       membership.role === "STAFF" || membership.role === "ORGANIZER" || membership.trustScore > 90;
 
-    return await ctx.db.insert("reports", {
+    const reportId = await ctx.db.insert("reports", {
       eventId: args.eventId,
       reporterId: membership.userId,
       description,
@@ -144,8 +164,14 @@ export const create = mutation({
       views: 0,
       resolved: false,
       clientId: args.clientId,
+      imageStorageId: args.imageStorageId,
+      imageUrl: args.imageUrl,
       createdAt: Date.now(),
     });
+
+    await ctx.scheduler.runAfter(0, internal.orchestrator.processNewReport, { reportId });
+
+    return reportId;
   },
 });
 
@@ -230,6 +256,19 @@ export const updateStatus = mutation({
       if (reporter !== null) {
         await ctx.db.patch("memberships", reporter._id, {
           trustScore: Math.min(100, reporter.trustScore + 5),
+        });
+      }
+    } else if (args.status === "rejected") {
+      // Abuse penalty: deduct 5 trust points for false/rejected reports (Section 9.7)
+      const reporter = await ctx.db
+        .query("memberships")
+        .withIndex("by_event_user", (q) =>
+          q.eq("eventId", report.eventId).eq("userId", report.reporterId),
+        )
+        .unique();
+      if (reporter !== null) {
+        await ctx.db.patch("memberships", reporter._id, {
+          trustScore: Math.max(0, reporter.trustScore - 5),
         });
       }
     }

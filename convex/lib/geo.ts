@@ -61,3 +61,64 @@ export function clampPercent(value: number, field: string): number {
   if (!Number.isFinite(value)) throw new Error(`${field} must be a number between 0 and 100.`);
   return Math.max(0, Math.min(100, value));
 }
+
+/**
+ * GPS Geofencing & Coordinate Transformation (Section 9.5)
+ * Transforms real-world WGS84 GPS coordinates (latitude, longitude)
+ * into venue map pin percentages (0-100%), and verifies if reporter is inside geofence.
+ */
+export interface VenueGeoBounds {
+  minLat: number;
+  maxLat: number;
+  minLon: number;
+  maxLon: number;
+}
+
+// Default reference coordinates centered at IIT Delhi campus venue
+export const DEFAULT_VENUE_BOUNDS: VenueGeoBounds = {
+  minLat: 28.539,
+  maxLat: 28.552,
+  minLon: 77.185,
+  maxLon: 77.200,
+};
+
+export function validateGeofence(
+  lat: number,
+  lon: number,
+  bounds: VenueGeoBounds = DEFAULT_VENUE_BOUNDS,
+): { isInside: boolean; pinX: number; pinY: number; distanceKm: number } {
+  const isInside =
+    lat >= bounds.minLat &&
+    lat <= bounds.maxLat &&
+    lon >= bounds.minLon &&
+    lon <= bounds.maxLon;
+
+  // Convert GPS coordinates to normalized 0-100% floor plan space
+  const latSpan = bounds.maxLat - bounds.minLat;
+  const lonSpan = bounds.maxLon - bounds.minLon;
+
+  const pinX = Math.max(0, Math.min(100, ((lon - bounds.minLon) / lonSpan) * 100));
+  // Y inverted: top of map is maxLat (North)
+  const pinY = Math.max(0, Math.min(100, ((bounds.maxLat - lat) / latSpan) * 100));
+
+  // Center distance approximation using Haversine formula
+  const centerLat = (bounds.minLat + bounds.maxLat) / 2;
+  const centerLon = (bounds.minLon + bounds.maxLon) / 2;
+  const dLat = ((lat - centerLat) * Math.PI) / 180;
+  const dLon = ((lon - centerLon) * Math.PI) / 180;
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos((centerLat * Math.PI) / 180) *
+      Math.cos((lat * Math.PI) / 180) *
+      Math.sin(dLon / 2) *
+      Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  const distanceKm = 6371 * c;
+
+  return {
+    isInside,
+    pinX: Math.round(pinX * 10) / 10,
+    pinY: Math.round(pinY * 10) / 10,
+    distanceKm: Math.round(distanceKm * 100) / 100,
+  };
+}
