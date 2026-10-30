@@ -12,6 +12,13 @@ export async function executeSeedZones(ctx: MutationCtx, eventId: Id<"events">):
     .take(1);
 
   if (existingZones.length > 0) {
+    const gate4 = await ctx.db.query("zones").withIndex("by_event", q => q.eq("eventId", eventId)).take(100);
+    let updatedEgress = false;
+    for (const zone of gate4) if (zone.name === "Gate 4" && zone.telemetrySource === "simulation" && zone.isDesignatedEgress === undefined) { await ctx.db.patch("zones", zone._id, { isDesignatedEgress: true, updatedAt: Date.now() }); updatedEgress = true; }
+    if (updatedEgress) {
+      const routes = await ctx.db.query("routeRecommendations").withIndex("by_event_active", q => q.eq("eventId", eventId).eq("isActive", true)).take(100);
+      for (const route of routes) await ctx.db.patch("routeRecommendations", route._id, { isActive: false });
+    }
     return true;
   }
 
@@ -47,6 +54,8 @@ export async function executeSeedZones(ctx: MutationCtx, eventId: Id<"events">):
       exitBlocked: false,
       isNarrowPassage: zone.isNarrow,
       updatedAt: Date.now(),
+      telemetryAt: Date.now(), telemetrySource: "simulation", telemetryStale: false,
+      isDesignatedEgress: zone.name === "Gate 4",
     });
     zoneIds[zone.name] = id;
   }
@@ -98,6 +107,36 @@ export async function executeSeedZones(ctx: MutationCtx, eventId: Id<"events">):
   return true;
 }
 
+async function resetSimulatedVenue(ctx: MutationCtx, eventId: Id<"events">) {
+  const zones = await ctx.db.query("zones").withIndex("by_event", q => q.eq("eventId", eventId)).take(101);
+  if (zones.length > 100) throw new Error("Venue exceeds the demo graph limit.");
+  const now = Date.now();
+  let refreshed = 0;
+  for (const zone of zones) {
+    if (zone.telemetrySource !== "simulation") continue;
+    await ctx.db.patch("zones", zone._id, {
+      currentOccupancy: Math.floor(zone.capacity * 0.25), inflowRate: 10, outflowRate: 8,
+      exitBlocked: false, telemetryAt: now, telemetryStale: false, updatedAt: now,
+    });
+    refreshed++;
+  }
+  const active = await ctx.db.query("routeRecommendations").withIndex("by_event_active", q => q.eq("eventId", eventId).eq("isActive", true)).take(101);
+  if (active.length > 100) throw new Error("Too many active routes; operator review required.");
+  for (const route of active) await ctx.db.patch("routeRecommendations", route._id, { isActive: false });
+  await logAgentAction(ctx, eventId, "crowd_intel", "reset_demo_telemetry", "Simulation venue reset", `${refreshed} simulation-sourced zone readings refreshed; manually observed zones were preserved. Prior route proposals invalidated.`, "info");
+}
+
+/** Ensure the command center has aggregate zone telemetry before rendering risk. */
+export const ensureZones = mutation({
+  args: { eventId: v.id("events") },
+  handler: async (ctx, args) => {
+    await requireRole(ctx, args.eventId, ["ORGANIZER", "STAFF"]);
+    await executeSeedZones(ctx, args.eventId);
+    await ctx.scheduler.runAfter(0, internal.agents.crowdIntel.assessAllZones, { eventId: args.eventId });
+    return true;
+  },
+});
+
 /** Seed the venue zones and network graph for an event */
 export const seedVenueZones = internalMutation({
   args: { eventId: v.id("events") },
@@ -114,14 +153,11 @@ export async function executeSeedResponders(ctx: MutationCtx, eventId: Id<"event
 
   if (existing.length > 0) return true;
 
-  const members = await ctx.db
-    .query("memberships")
-    .withIndex("by_event_role", (q) => q.eq("eventId", eventId))
-    .take(10);
-
-  const fallbackUserId = members[0]?.userId;
-  const fallbackMembershipId = members[0]?._id;
-  if (!fallbackUserId || !fallbackMembershipId) return false;
+  const members = [
+    ...await ctx.db.query("memberships").withIndex("by_event_role", q => q.eq("eventId", eventId).eq("role", "STAFF")).take(10),
+    ...await ctx.db.query("memberships").withIndex("by_event_role", q => q.eq("eventId", eventId).eq("role", "ORGANIZER")).take(10),
+  ].filter(member => !member.isBanned);
+  if (!members.length) return false;
 
   const ROSTER = [
     {
@@ -166,9 +202,9 @@ export async function executeSeedResponders(ctx: MutationCtx, eventId: Id<"event
     },
   ];
 
-  for (let i = 0; i < ROSTER.length; i++) {
+  for (let i = 0; i < Math.min(ROSTER.length, members.length); i++) {
     const r = ROSTER[i];
-    const member = members[i % members.length] ?? members[0];
+    const member = members[i];
 
     await ctx.db.insert("responders", {
       eventId,
@@ -217,6 +253,7 @@ export const injectReport = internalMutation({
 
     const clientId = `sim-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     const reportId = await ctx.db.insert("reports", {
+      isSimulated: true,
       eventId: args.eventId,
       reporterId: randomMember.userId,
       description: args.description,
@@ -257,12 +294,15 @@ export const updateCrowdData = internalMutation({
     if (!zone) return;
 
     await ctx.db.patch("zones", zone._id, {
+      telemetryAt: Date.now(), telemetrySource: "simulation", telemetryStale: false,
       currentOccupancy: args.occupancy,
       inflowRate: args.inflowRate,
       outflowRate: args.outflowRate,
       exitBlocked: args.exitBlocked ?? zone.exitBlocked,
       updatedAt: Date.now(),
     });
+    const activeRoutes = await ctx.db.query("routeRecommendations").withIndex("by_event_active", q => q.eq("eventId", args.eventId).eq("isActive", true)).take(100);
+    for (const route of activeRoutes) await ctx.db.patch("routeRecommendations", route._id, { isActive: false });
 
     await logAgentAction(
       ctx,
@@ -277,6 +317,8 @@ export const updateCrowdData = internalMutation({
     await ctx.scheduler.runAfter(0, internal.agents.crowdIntel.assessAllZones, {
       eventId: args.eventId,
     });
+    const incidents = await ctx.db.query("incidents").withIndex("by_event_created", q => q.eq("eventId", args.eventId)).order("desc").take(20);
+    for (const incident of incidents) if (!incident.isResolved) await ctx.scheduler.runAfter(0, internal.orchestrator.runCrowdIntel, { incidentId: incident._id });
   },
 });
 
@@ -287,7 +329,7 @@ export async function executeSimulateCrisis(ctx: MutationCtx, eventId: Id<"event
     "orchestrator",
     "simulateGate3Crisis",
     "CRISIS SIMULATION INITIATED: Gate 3 Surge & Multi-Agent Response",
-    "Injecting paced multi-agent incidents demonstrating Vision, Deduplication, Multi-lingual NLP & Dispatch",
+    "Injecting paced multi-agent incidents demonstrating scripted surge, deduplication, multilingual NLP & dispatch",
     "action",
   );
 
@@ -295,7 +337,7 @@ export async function executeSimulateCrisis(ctx: MutationCtx, eventId: Id<"event
   // Each pipeline run takes ~16-20 seconds with full visible agent deliberation
   const SIMULATED_STREAM = [
     {
-      // Incident 1: Demonstrates Multi-modal Vision + NLP + Corroboration + Dijkstra Evacuation
+      // Scripted showcase report. Simulated reports skip provider analysis; this URL is display-only.
       desc: "Massive crowd buildup at Gate 3 entrance, people pushing violently against turnstiles",
       pinX: 65,
       pinY: 45,
@@ -377,6 +419,7 @@ export const triggerGate3Simulation = mutation({
 
     await executeSeedZones(ctx, args.eventId);
     await executeSeedResponders(ctx, args.eventId);
+    await resetSimulatedVenue(ctx, args.eventId);
 
     await executeSimulateCrisis(ctx, args.eventId);
 
@@ -394,6 +437,7 @@ export const triggerSingleShowcaseReport = mutation({
     await requireRole(ctx, args.eventId, ["ORGANIZER", "STAFF"]);
     await executeSeedZones(ctx, args.eventId);
     await executeSeedResponders(ctx, args.eventId);
+    await resetSimulatedVenue(ctx, args.eventId);
 
     const type = args.scenarioType ?? "stampede";
     let desc = "Massive crowd buildup at Gate 3 entrance, people pushing violently against turnstiles";
@@ -452,6 +496,7 @@ export const verifyIncidentByStaff = mutation({
     if (!incident) throw new Error("Incident not found");
 
     const moderator = await requireRole(ctx, incident.eventId, ["ORGANIZER", "STAFF"]);
+    if (incident.isResolved) throw new Error("Cannot verify a resolved incident.");
 
     await ctx.db.patch("incidents", incident._id, {
       verificationStatus: "VERIFIED",
@@ -472,7 +517,7 @@ export const verifyIncidentByStaff = mutation({
       incident._id,
     );
 
-    await ctx.scheduler.runAfter(0, internal.orchestrator.runResponsePlanning, {
+    await ctx.scheduler.runAfter(0, internal.orchestrator.runVerification, {
       incidentId: incident._id,
     });
 

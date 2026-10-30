@@ -1,9 +1,10 @@
 import { v } from "convex/values";
-import type { Doc, Id } from "../_generated/dataModel";
+import type { Id } from "../_generated/dataModel";
 import { internal } from "../_generated/api";
 import { internalMutation, internalQuery, type MutationCtx } from "../_generated/server";
 import { logAgentAction } from "../lib/agentLog";
 import { canDispatchEmergencyService } from "../lib/safety";
+import { ACTIVE_TASKS, INITIAL_SEARCH_RADIUS_METERS, qualifiedResponder, rankResponders, responderDistance, responderEta } from "../lib/dispatchPolicy";
 import { responderTypeValidator } from "../schema";
 
 /** Tool: Find available responders ranked by proximity and skill match */
@@ -15,12 +16,12 @@ export const find_available_responders = internalQuery({
   },
   handler: async (ctx, args) => {
     const incident = await ctx.db.get("incidents", args.incidentId);
-    if (!incident) throw new Error("Incident not found");
+    if (!incident || incident.eventId !== args.eventId) throw new Error("Incident event mismatch");
 
     const allResponders = await ctx.db
       .query("responders")
       .withIndex("by_event", (q) => q.eq("eventId", args.eventId))
-      .take(50);
+      .take(100);
 
     const scored: Array<{
       responderId: Id<"responders">;
@@ -33,32 +34,18 @@ export const find_available_responders = internalQuery({
       score: number;
     }> = [];
 
+    const valid = [];
     for (const r of allResponders) {
-      const posX = r.posX ?? 50;
-      const posY = r.posY ?? 50;
-      const distPercent = Math.hypot(posX - incident.pinX, posY - incident.pinY);
-      const distanceMeters = Math.round(distPercent * 12);
-      const etaSeconds = Math.max(30, Math.round(distPercent * 4));
-
-      let skillBonus = 1.0;
-      if (incident.incidentType === "medical" && (r.hasFirstAid || r.responderType === "medical")) {
-        skillBonus = 2.5;
-      } else if (incident.incidentType === "fire" && (r.hasFireTraining || r.responderType === "fire")) {
-        skillBonus = 2.5;
-      } else if (incident.incidentType === "security" && r.responderType === "security") {
-        skillBonus = 2.0;
-      } else if (incident.incidentType === "stampede" && (r.responderType === "security" || r.responderType === "volunteer")) {
-        skillBonus = 1.8;
-      }
-
-      if (args.requiredType && r.responderType === args.requiredType) {
-        skillBonus *= 1.5;
-      }
-
-      const availBonus = r.isAvailable ? 2.0 : 0.3;
-      const distWeight = Math.max(1, distanceMeters);
-      const score = (1000 / distWeight) * skillBonus * availBonus;
-
+      const member = await ctx.db.get("memberships", r.membershipId);
+      if (member && member.eventId === incident.eventId && member.userId === r.userId && !member.isBanned && member.role !== "ATTENDEE" && (!args.requiredType || r.responderType === args.requiredType)) valid.push(r);
+    }
+    const recentTasks = await ctx.db.query("dispatchTasks").withIndex("by_event", q => q.eq("eventId", incident.eventId)).order("desc").take(100);
+    const workload: Record<string, number> = {};
+    for (const task of recentTasks) workload[task.responderId] = (workload[task.responderId] ?? 0) + 1;
+    const ranked = rankResponders(valid, incident, workload);
+    for (const r of ranked) {
+      const distanceMeters = responderDistance(r, incident);
+      const etaSeconds = responderEta(distanceMeters);
       scored.push({
         responderId: r._id,
         userId: r.userId,
@@ -67,11 +54,9 @@ export const find_available_responders = internalQuery({
         isAvailable: r.isAvailable,
         distanceMeters,
         etaSeconds,
-        score,
+        score: ranked.length - scored.length,
       });
     }
-
-    scored.sort((a, b) => b.score - a.score);
     return scored;
   },
 });
@@ -87,330 +72,125 @@ export const calculate_responder_eta = internalQuery({
     const incident = await ctx.db.get("incidents", args.incidentId);
     if (!responder || !incident) throw new Error("Responder or Incident not found");
 
-    const posX = responder.posX ?? 50;
-    const posY = responder.posY ?? 50;
-    const distPercent = Math.hypot(posX - incident.pinX, posY - incident.pinY);
-    const distanceMeters = Math.round(distPercent * 12);
-    const etaSeconds = Math.max(30, Math.round(distPercent * 4));
+    if (responder.eventId !== incident.eventId) throw new Error("Responder and incident event mismatch.");
+    const distanceMeters = responderDistance(responder, incident);
+    const etaSeconds = responderEta(distanceMeters);
 
     return {
       etaSeconds,
       distanceMeters,
-      routeDescription: `Direct route: approximately ${distanceMeters}m (${Math.ceil(etaSeconds / 60)} min walk)`,
+      routeDescription: `Straight-line map estimate: approximately ${distanceMeters}m (${Math.ceil(etaSeconds / 60)} min). Confirm the passable staff-access route on site.`,
     };
   },
 });
 
-export async function executeAssignResponder(
-  ctx: MutationCtx,
-  args: {
-    responderId: Id<"responders">;
-    incidentId: Id<"incidents">;
-    instruction?: string;
-  },
-): Promise<Id<"dispatchTasks">> {
+export async function executeAssignResponder(ctx: MutationCtx, args: {
+  responderId: Id<"responders">; incidentId: Id<"incidents">; instruction?: string;
+  purpose?: "verification" | "response"; escalationCount?: number;
+}): Promise<Id<"dispatchTasks">> {
   const responder = await ctx.db.get("responders", args.responderId);
   const incident = await ctx.db.get("incidents", args.incidentId);
-  if (!responder || !incident) throw new Error("Responder or Incident not found");
-
-  const posX = responder.posX ?? 50;
-  const posY = responder.posY ?? 50;
-  const distPercent = Math.hypot(posX - incident.pinX, posY - incident.pinY);
-  const distanceMeters = Math.round(distPercent * 12);
-  const etaSeconds = Math.max(30, Math.round(distPercent * 4));
-
-  const instruction =
-    args.instruction ??
-    `Dispatch: Respond to ${incident.incidentType} incident at ${incident.location} (${incident.incidentCode}).`;
-
-  const taskId = await ctx.db.insert("dispatchTasks", {
-    eventId: incident.eventId,
-    incidentId: incident._id,
-    responderId: responder._id,
-    instruction,
-    status: "pending",
-    estimatedEta: etaSeconds,
-    distanceMeters,
-    assignedAt: Date.now(),
-    isEmergencyDispatch: false,
-  });
-
-  await ctx.db.patch("responders", responder._id, {
-    isAvailable: false,
-    currentTaskId: taskId,
-    updatedAt: Date.now(),
-  });
-
-  await logAgentAction(
-    ctx,
-    incident.eventId,
-    "dispatch",
-    "assign_and_notify_responder",
-    `Incident ${incident.incidentCode} → ${responder.name ?? responder.responderType}`,
-    `Task created. ETA: ${Math.ceil(etaSeconds / 60)} min (${distanceMeters}m). Auto-escalation scheduled.`,
-    "action",
-    incident._id,
-  );
-
-  // Auto escalation check in 3 minutes
-  await ctx.scheduler.runAfter(180_000, internal.agents.dispatch.checkTaskAcceptance, {
-    taskId,
-  });
-
+  if (!responder || !incident || responder.eventId !== incident.eventId) throw new Error("Responder or incident event mismatch.");
+  if (incident.isResolved) throw new Error("Incident is resolved.");
+  const purpose = args.purpose ?? "response";
+  if (purpose === "response" && incident.verificationStatus !== "VERIFIED") throw new Error("Response requires verified evidence; request staff verification instead.");
+  const existing = await ctx.db.query("dispatchTasks").withIndex("by_incident", q => q.eq("incidentId", incident._id)).take(101);
+  if (existing.length > 100) throw new Error("Task history limit reached; operator review required.");
+  const active = existing.find(t => !t.isEmergencyDispatch && ACTIVE_TASKS.has(t.status) && (t.purpose ?? "response") === purpose);
+  if (active) return active._id;
+  if (!responder.isAvailable || responder.currentTaskId || responder.assignmentZoneId) throw new Error("Responder is already assigned.");
+  const member = await ctx.db.get("memberships", responder.membershipId);
+  if (!member || member.eventId !== incident.eventId || member.userId !== responder.userId || member.isBanned || member.role === "ATTENDEE") throw new Error("Responder is not authorized for this event.");
+  if (purpose === "response" && !qualifiedResponder(responder, incident.incidentType)) throw new Error("Responder does not have the required capability.");
+  const distanceMeters = responderDistance(responder, incident);
+  const taskId = await ctx.db.insert("dispatchTasks", { eventId: incident.eventId, incidentId: incident._id, responderId: responder._id,
+    instruction: (args.instruction ?? `Respond to ${incident.incidentType} at ${incident.location} (${incident.incidentCode}).`).slice(0, 1500),
+    status: "pending", estimatedEta: responderEta(distanceMeters), distanceMeters,
+    assignedAt: Date.now(), isEmergencyDispatch: false, purpose, escalationCount: args.escalationCount ?? 0 });
+  await ctx.db.patch("responders", responder._id, { isAvailable: false, currentTaskId: taskId, updatedAt: Date.now() });
+  await ctx.scheduler.runAfter(180_000, internal.agents.dispatch.checkTaskAcceptance, { taskId });
+  await logAgentAction(ctx, incident.eventId, "dispatch", "assign_and_notify_responder", `${incident.incidentCode}: ${purpose}`, `Task assigned in app; ${distanceMeters}m away (${distanceMeters > INITIAL_SEARCH_RADIUS_METERS ? "expanded search" : "initial 100m search"}). Waiting for acknowledgment; ETA is an estimate.`, "action", incident._id);
   return taskId;
 }
-
-/** Tool: Assign and notify responder */
 export const assign_and_notify_responder = internalMutation({
-  args: {
-    responderId: v.id("responders"),
-    incidentId: v.id("incidents"),
-    instruction: v.optional(v.string()),
-  },
-  handler: async (ctx, args) => {
-    return await executeAssignResponder(ctx, args);
-  },
+  args: { responderId: v.id("responders"), incidentId: v.id("incidents"), instruction: v.optional(v.string()) }, handler: executeAssignResponder,
 });
-
-export async function executeEscalateTask(
-  ctx: MutationCtx,
-  taskId: Id<"dispatchTasks">,
-): Promise<Id<"dispatchTasks"> | null> {
+export async function executeEscalateTask(ctx: MutationCtx, taskId: Id<"dispatchTasks">): Promise<Id<"dispatchTasks"> | null> {
   const task = await ctx.db.get("dispatchTasks", taskId);
-  if (!task || task.status !== "pending") return null;
-
-  const originalResponder = await ctx.db.get("responders", task.responderId);
+  if (!task || (task.status !== "pending" && task.status !== "rejected") || task.isEmergencyDispatch) return null;
+  if (task.escalatedToTaskId) return task.escalatedToTaskId;
   const incident = await ctx.db.get("incidents", task.incidentId);
-  if (!incident) return null;
-
-  if (originalResponder) {
-    await ctx.db.patch("responders", originalResponder._id, {
-      isAvailable: true,
-      currentTaskId: undefined,
-      updatedAt: Date.now(),
-    });
+  const original = await ctx.db.get("responders", task.responderId);
+  if (original?.currentTaskId === task._id) await ctx.db.patch("responders", original._id, { isAvailable: true, currentTaskId: undefined, updatedAt: Date.now() });
+  if (task.status === "pending") await ctx.db.patch("dispatchTasks", task._id, { status: incident?.isResolved ? "canceled" : "escalated", completedAt: Date.now() });
+  if (!incident || incident.isResolved) return null;
+  const count = task.escalationCount ?? 0;
+  const purpose = task.purpose ?? "response";
+  const responders = count < 2 ? await ctx.db.query("responders").withIndex("by_event_available", q => q.eq("eventId", task.eventId).eq("isAvailable", true)).take(100) : [];
+  const available = [];
+  for (const responder of responders) {
+    if (responder._id === task.responderId || responder.currentTaskId || (purpose === "response" && !qualifiedResponder(responder, incident.incidentType))) continue;
+    const member = await ctx.db.get("memberships", responder.membershipId);
+    if (member && member.eventId === incident.eventId && member.userId === responder.userId && !member.isBanned && member.role !== "ATTENDEE") available.push(responder);
   }
-
-  const available = await ctx.db
-    .query("responders")
-    .withIndex("by_event_available", (q) =>
-      q.eq("eventId", incident.eventId).eq("isAvailable", true),
-    )
-    .filter((q) => q.neq(q.field("_id"), task.responderId))
-    .take(10);
-
-  let nextResponder: Doc<"responders"> | null = null;
-  let minDistance = Infinity;
-
-  for (const r of available) {
-    const dist = Math.hypot((r.posX ?? 50) - incident.pinX, (r.posY ?? 50) - incident.pinY);
-    if (dist < minDistance) {
-      minDistance = dist;
-      nextResponder = r;
-    }
+  const recentTasks = await ctx.db.query("dispatchTasks").withIndex("by_event", q => q.eq("eventId", incident.eventId)).order("desc").take(100);
+  const workload: Record<string, number> = {};
+  for (const item of recentTasks) workload[item.responderId] = (workload[item.responderId] ?? 0) + 1;
+  const ranked = rankResponders(available, incident, workload, purpose === "response");
+  if (ranked[0]) {
+    const next = await executeAssignResponder(ctx, { responderId: ranked[0]._id, incidentId: incident._id, purpose, instruction: `[ESCALATED] ${task.instruction}`, escalationCount: count + 1 });
+    await ctx.db.patch("dispatchTasks", task._id, { escalatedToTaskId: next });
+    return next;
   }
-
-  if (nextResponder) {
-    const newTaskId = await ctx.db.insert("dispatchTasks", {
-      eventId: incident.eventId,
-      incidentId: incident._id,
-      responderId: nextResponder._id,
-      instruction: `[ESCALATED] ${task.instruction}`,
-      status: "pending",
-      estimatedEta: Math.round(minDistance * 4),
-      distanceMeters: Math.round(minDistance * 12),
-      assignedAt: Date.now(),
-      isEmergencyDispatch: false,
-    });
-
-    await ctx.db.patch("responders", nextResponder._id, {
-      isAvailable: false,
-      currentTaskId: newTaskId,
-      updatedAt: Date.now(),
-    });
-
-    await ctx.db.patch("dispatchTasks", task._id, {
-      status: "escalated",
-      escalatedToTaskId: newTaskId,
-    });
-
-    await logAgentAction(
-      ctx,
-      incident.eventId,
-      "dispatch",
-      "escalate_unaccepted_task",
-      `Task for ${incident.incidentCode} unaccepted by ${originalResponder?.name ?? "responder"}`,
-      `Reassigned to ${nextResponder.name ?? nextResponder.responderType} (ETA ~${Math.ceil((minDistance * 4) / 60)} min)`,
-      "warn",
-      incident._id,
-    );
-
-    return newTaskId;
-  } else {
-    await ctx.db.patch("dispatchTasks", task._id, { status: "escalated" });
-    await logAgentAction(
-      ctx,
-      incident.eventId,
-      "dispatch",
-      "escalate_unaccepted_task",
-      `Task for ${incident.incidentCode} timed out`,
-      "No other available responders to escalate to; manual staff intervention needed",
-      "error",
-      incident._id,
-    );
-    return null;
-  }
+  await logAgentAction(ctx, incident.eventId, "dispatch", "escalation_requires_operator", incident.incidentCode, "No qualified replacement or escalation limit reached. Contact event control manually.", "error", incident._id);
+  if (purpose === "verification") await ctx.db.patch("incidents", incident._id, { staffVerificationRequested: false, updatedAt: Date.now() });
+  return null;
 }
-
-/** Tool: Escalate unaccepted dispatch task */
-export const escalate_unaccepted_task = internalMutation({
-  args: { taskId: v.id("dispatchTasks") },
-  handler: async (ctx, args) => {
-    return await executeEscalateTask(ctx, args.taskId);
-  },
-});
-
-/** Auto-escalation timeout handler */
-export const checkTaskAcceptance = internalMutation({
-  args: { taskId: v.id("dispatchTasks") },
-  handler: async (ctx, args) => {
-    const task = await ctx.db.get("dispatchTasks", args.taskId);
-    if (task && task.status === "pending") {
-      await executeEscalateTask(ctx, args.taskId);
-    }
-  },
-});
-
-export async function executeEmergencyDispatch(
-  ctx: MutationCtx,
-  incidentId: Id<"incidents">,
-  service: "ambulance" | "fire_brigade" | "police",
-): Promise<{ success: boolean; reason: string }> {
+export const escalate_unaccepted_task = internalMutation({ args: { taskId: v.id("dispatchTasks") }, handler: async (ctx, { taskId }) => executeEscalateTask(ctx, taskId) });
+export const checkTaskAcceptance = internalMutation({ args: { taskId: v.id("dispatchTasks") }, handler: async (ctx, { taskId }) => executeEscalateTask(ctx, taskId) });
+export const checkArrival = internalMutation({ args: { taskId: v.id("dispatchTasks") }, handler: async (ctx, { taskId }) => {
+  const task = await ctx.db.get("dispatchTasks", taskId);
+  if (!task || (task.status !== "accepted" && task.status !== "en_route")) return;
+  const incident = await ctx.db.get("incidents", task.incidentId);
+  if (!incident || incident.isResolved) return;
+  await logAgentAction(ctx, task.eventId, "dispatch", "arrival_overdue", incident.incidentCode, "Responder has not marked on scene by the review deadline. Control room must confirm location or reassign.", "warn", incident._id);
+} });
+export async function executeEmergencyDispatch(ctx: MutationCtx, incidentId: Id<"incidents">, service: "ambulance" | "fire_brigade" | "police") {
   const incident = await ctx.db.get("incidents", incidentId);
-  if (!incident) throw new Error("Incident not found");
-
-  const safetyCheck = canDispatchEmergencyService(incident.verificationStatus);
-
-  if (!safetyCheck.allowed) {
-    await logAgentAction(
-      ctx,
-      incident.eventId,
-      "safety",
-      "canDispatchEmergencyService",
-      `${service.toUpperCase()} request for ${incident.incidentCode} (Status=${incident.verificationStatus})`,
-      `BLOCKED: ${safetyCheck.reason}`,
-      "warn",
-      incident._id,
-    );
-    return { success: false, reason: safetyCheck.reason };
-  }
-
-  const responders = await ctx.db
-    .query("responders")
-    .withIndex("by_event", (q) => q.eq("eventId", incident.eventId))
-    .take(1);
-
-  const mockResponderId = responders[0]?._id;
-  if (mockResponderId) {
-    await ctx.db.insert("dispatchTasks", {
-      eventId: incident.eventId,
-      incidentId: incident._id,
-      responderId: mockResponderId,
-      instruction: `MOCK DISPATCH: Outgoing call to city ${service.toUpperCase()} for ${incident.location} (${incident.description})`,
-      status: "accepted",
-      assignedAt: Date.now(),
-      acceptedAt: Date.now(),
-      isEmergencyDispatch: true,
-      emergencyService: service,
-    });
-  }
-
-  await logAgentAction(
-    ctx,
-    incident.eventId,
-    "dispatch",
-    "request_emergency_dispatch",
-    `Incident ${incident.incidentCode} [VERIFIED]`,
-    `MOCK DISPATCH: City ${service.toUpperCase()} requested for ${incident.location}`,
-    "action",
-    incident._id,
-  );
-
-  return { success: true, reason: "Emergency service dispatched" };
+  if (!incident || incident.isResolved) return { success: false, reason: "No active incident.", simulated: false };
+  const check = canDispatchEmergencyService(incident.verificationStatus);
+  await logAgentAction(ctx, incident.eventId, "safety", "external_dispatch_held", `${incident.incidentCode}: ${service}`, check.allowed ? "External delivery is not configured. Operator must contact emergency services through the venue procedure." : check.reason, "warn", incidentId);
+  return { success: false, reason: check.allowed ? "External dispatch is not configured; no emergency service was contacted." : check.reason, simulated: false };
 }
-
-/** Tool: External emergency service request with safety check */
 export const request_emergency_dispatch = internalMutation({
-  args: {
-    incidentId: v.id("incidents"),
-    service: v.union(v.literal("ambulance"), v.literal("fire_brigade"), v.literal("police")),
-  },
-  handler: async (ctx, args) => {
-    return await executeEmergencyDispatch(ctx, args.incidentId, args.service);
-  },
+  args: { incidentId: v.id("incidents"), service: v.union(v.literal("ambulance"), v.literal("fire_brigade"), v.literal("police")) }, handler: async (ctx, args) => executeEmergencyDispatch(ctx, args.incidentId, args.service),
 });
-
-/** Workflow step: Dispatch planning */
 export const dispatchResponders = internalMutation({
-  args: {
-    incidentId: v.id("incidents"),
-    allowEmergencyServices: v.boolean(),
-  },
-  handler: async (ctx, args) => {
+  args: { incidentId: v.id("incidents"), allowEmergencyServices: v.boolean() }, handler: async (ctx, args): Promise<Id<"dispatchTasks"> | null> => {
     const incident = await ctx.db.get("incidents", args.incidentId);
-    if (!incident) return null;
-
-    if (incident.verificationStatus === "UNVERIFIED") {
-      await logAgentAction(
-        ctx,
-        incident.eventId,
-        "dispatch",
-        "dispatchResponders",
-        `Incident ${incident.incidentCode} is UNVERIFIED`,
-        "Internal dispatch held until corroboration",
-        "info",
-        incident._id,
-      );
-      return null;
+    if (!incident || incident.isResolved || incident.verificationStatus !== "VERIFIED") return null;
+    const tasks = await ctx.db.query("dispatchTasks").withIndex("by_incident", q => q.eq("incidentId", incident._id)).take(101);
+    if (tasks.length > 100) return null;
+    const existing = tasks.find(t => !t.isEmergencyDispatch && ACTIVE_TASKS.has(t.status) && (t.purpose ?? "response") === "response");
+    if (existing) return existing._id;
+    // Completed responses do not silently create a new assignment on evidence updates.
+    if (tasks.some(t => (t.purpose ?? "response") === "response" && t.status === "completed")) return null;
+    const responders = await ctx.db.query("responders").withIndex("by_event_available", q => q.eq("eventId", incident.eventId).eq("isAvailable", true)).take(100);
+    const eligible = [];
+    for (const r of responders) {
+      const member = await ctx.db.get("memberships", r.membershipId);
+      if (!r.currentTaskId && qualifiedResponder(r, incident.incidentType) && member && member.userId === r.userId && member.eventId === incident.eventId && !member.isBanned && member.role !== "ATTENDEE") eligible.push(r);
     }
-
-    const availableResponders = await ctx.db
-      .query("responders")
-      .withIndex("by_event_available", (q) =>
-        q.eq("eventId", incident.eventId).eq("isAvailable", true),
-      )
-      .take(20);
-
-    let assignedId: Id<"dispatchTasks"> | null = null;
-    if (availableResponders.length > 0) {
-      let best = availableResponders[0];
-      let bestDist = Infinity;
-
-      for (const r of availableResponders) {
-        const dist = Math.hypot((r.posX ?? 50) - incident.pinX, (r.posY ?? 50) - incident.pinY);
-        if (dist < bestDist) {
-          bestDist = dist;
-          best = r;
-        }
-      }
-
-      assignedId = await executeAssignResponder(ctx, {
-        responderId: best._id,
-        incidentId: incident._id,
-      });
-    }
-
-    if (incident.incidentType === "medical" || incident.incidentType === "stampede" || incident.incidentType === "fire") {
-      const service =
-        incident.incidentType === "medical" || incident.incidentType === "stampede"
-          ? "ambulance"
-          : incident.incidentType === "fire"
-          ? "fire_brigade"
-          : "police";
-
+    const recentTasks = await ctx.db.query("dispatchTasks").withIndex("by_event", q => q.eq("eventId", incident.eventId)).order("desc").take(100);
+    const workload: Record<string, number> = {};
+    for (const task of recentTasks) workload[task.responderId] = (workload[task.responderId] ?? 0) + 1;
+    const ranked = rankResponders(eligible, incident, workload);
+    const taskId = ranked[0] ? await executeAssignResponder(ctx, { responderId: ranked[0]._id, incidentId: incident._id }) : null;
+    if (!taskId) await logAgentAction(ctx, incident.eventId, "dispatch", "no_qualified_responder", incident.incidentCode, "No qualified available responder. Operator intervention required.", "warn", incident._id);
+    if (args.allowEmergencyServices) {
+      const service = incident.incidentType === "fire" ? "fire_brigade" : incident.incidentType === "security" ? "police" : "ambulance";
       await executeEmergencyDispatch(ctx, incident._id, service);
     }
-
-    return assignedId;
+    return taskId;
   },
 });

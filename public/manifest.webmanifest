@@ -1,0 +1,18 @@
+{
+  "name": "EventPulse emergency staff console",
+  "short_name": "EventPulse",
+  "description": "Live incident alerts and response coordination for event staff.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#e8e4dc",
+  "theme_color": "#b91c1c",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

@@ -2,6 +2,10 @@
 
 Real-time incident reporting for live events.
 
+Optional OpenAI/LangChain analysis, approved-source RAG, and deterministic incident
+agents are documented in [AI operations and rollout](docs/AI_OPERATIONS.md).
+AI defaults to off; complete staging validation before enabling it for a live event.
+
 **Live:** https://eventpulsee.netlify.app
 
 Attendees scan a QR at the gate, see a live floor plan of the venue, and report
@@ -28,12 +32,17 @@ and watch it appear on both screens without a refresh.
   mobile; desktop uses QR upload or manual code entry
 - **Floor plan upload** — organisers upload the venue map to Convex file storage
 - **Pin-based reporting** — tap the map, pick a priority, describe the issue
+- **Browser camera capture** — attendees can take a live incident photo in the
+  browser or choose an existing device image before submitting
 - **Automatic zone naming** — on the bundled campus map, a pin resolves to a
   named zone rather than a coordinate
 - **Staff moderation** — approve, reject and resolve, behind a strict server-side
   state machine
 - **Real-time propagation** — a verified report reaches every connected device
   without a refresh
+- **Staff emergency alerts** — active staff phones receive a live incident banner,
+  vibration and a browser notification; a staff member can arm an emergency
+  sound for new incidents with one tap
 - **Trust Score** — reporters build a score from their reporting history
 - **Points of interest** — staff place facilities on the map for attendees
 - **Session restore** — a refresh puts you back exactly where you were
@@ -128,6 +137,28 @@ The frontend deploys to Netlify from `main` (`npm run build` → `dist`). Set
 `VITE_CONVEX_URL` and `VITE_CONVEX_SITE_URL` in the Netlify environment, then
 point `SITE_URL` at the deployed origin and add it to the Google Console
 JavaScript origins.
+
+The repository's `netlify.toml` runs `npx convex deploy --cmd 'npm run build'`
+so a production build and its Convex functions are published together. Netlify
+must have a `CONVEX_DEPLOY_KEY` for the target production deployment. The
+browser bundle receives the production Convex URLs from that command; do not
+hard-code a local `.convex.cloud` URL in the deployed site.
+
+### Staff phone alerts
+
+When staff open an active event, the staff console subscribes to the event's
+incident query over Convex's realtime connection. A newly created incident
+shows an urgent banner immediately. On the first visit to a phone, tap
+**Enable sound** in the staff alert strip: mobile browsers block audio until a
+user gesture, so this step is required for the emergency tone. The same tap
+requests browser notification permission; **Enable phone** can be used later
+if sound and notification permission were handled separately.
+
+Keep the installed EventPulse web app or browser tab open during an event so
+the realtime connection stays active. If the phone's browser has been told to
+block notifications, allow them in the site's browser settings; the in-app
+banner and armed sound still work. The alert is generated from server-side
+incidents, so staff never rely on an attendee's local state or a manual refresh.
 
 ---
 

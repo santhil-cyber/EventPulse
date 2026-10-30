@@ -29,7 +29,7 @@ const AGENTS: AgentDef[] = [
     id: "intake",
     num: "1",
     name: "Intake Agent",
-    tagline: "NLP, Vision & Dedup",
+    tagline: "NLP & Dedup · optional photo analysis",
     tools: ["extract_incident_details", "find_duplicate_reports", "create_or_update_incident"],
     color: {
       bg: "bg-blue-50/70",
@@ -99,8 +99,6 @@ const AGENTS: AgentDef[] = [
 
 export function AgentPipelineVisualizer({
   eventId,
-  onSimulateFull,
-  isSimulating = false,
 }: AgentPipelineVisualizerProps) {
   const [showReasoningModal, setShowReasoningModal] = useState(false);
   const [now, setNow] = useState(Date.now());
@@ -109,6 +107,7 @@ export function AgentPipelineVisualizer({
   const activeRun = useQuery(api.agentPipeline.getActivePipelineRun, { eventId });
   const triggerSingleReport = useMutation(api.simulation.triggerSingleShowcaseReport);
   const resetRun = useMutation(api.agentPipeline.resetActivePipelineRun);
+  const retryRun = useMutation(api.agentPipeline.retryOperationalRun);
 
   // Update ticker for active elapsed timers
   useEffect(() => {
@@ -194,7 +193,7 @@ export function AgentPipelineVisualizer({
         <div className="flex items-center gap-2 flex-wrap">
           <div className="flex items-center gap-1.5 font-mono text-[11px] font-bold text-[#1a1917]">
             <span className="w-2.5 h-2.5 rounded-full bg-[#5b3ff8] animate-pulse" />
-            <span>Autonomous 5-Agent Pipeline</span>
+            <span>{activeRun?.isDemo ? "Demo · paced pipeline" : "Live incident workflow"}</span>
           </div>
 
           {activeRun ? (
@@ -217,6 +216,7 @@ export function AgentPipelineVisualizer({
                     : "Pipeline Completed ✓"}
               </span>
 
+              {activeRun.status === "failed" && !activeRun.isDemo && <button className="underline text-xs" onClick={() => void retryRun({ runId: activeRun._id }).catch(e => alert(e.message))}>Retry workflow</button>}
               <button
                 onClick={() => activeRun && resetRun({ runId: activeRun._id })}
                 className="px-1.5 py-0.5 rounded-full text-[9px] font-mono text-[#8a7f6e] hover:text-rose-600 hover:bg-rose-50 border border-transparent hover:border-rose-200 transition cursor-pointer"
@@ -242,9 +242,9 @@ export function AgentPipelineVisualizer({
             onClick={() => handleQuickScenario("stampede")}
             disabled={activeRun?.status === "running"}
             className="px-2.5 py-1 rounded-lg text-[10px] font-semibold bg-white hover:bg-[#ece7de] text-[#1a1917] border border-[#ded7cb] transition cursor-pointer disabled:opacity-50 shadow-2xs"
-            title="Demonstrates Computer Vision + Gate 3 Surge + Dijkstra Rerouting"
+            title="Demonstrates the scripted Gate 3 surge and Dijkstra rerouting; simulated photos are not sent to vision AI"
           >
-            📸 Vision & Surge
+            ⚠️ Surge Demo
           </button>
 
           <button
@@ -292,7 +292,6 @@ export function AgentPipelineVisualizer({
           {AGENTS.map((agent, idx) => {
             const isCurrent = activeAgentKey === agent.id && activeRun?.status === "running";
             const isCompleted = activeIndex > idx || isPipelineCompleted;
-            const isPending = activeIndex < idx && !isPipelineCompleted;
 
             // Timer calculation
             const timing = timestamps[agent.id];

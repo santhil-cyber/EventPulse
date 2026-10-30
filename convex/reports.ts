@@ -149,6 +149,20 @@ export const create = mutation({
     if (event === null) throw new Error("That event no longer exists.");
     const location = event.mapStorageId === undefined ? inferLocation(pinX, pinY) : NO_ZONE;
 
+    if (!event.isActive) throw new Error("This event is no longer active.");
+    // Resolve stored images server-side; browser blob URLs are never persisted.
+    let imageUrl: string | undefined;
+    if (args.imageStorageId) {
+      const upload = await ctx.db.query("evidenceUploads").withIndex("by_storageId", q => q.eq("storageId", args.imageStorageId!)).unique();
+      if (!upload || upload.eventId !== args.eventId || upload.uploaderId !== membership.userId) throw new Error("Upload this image for the current event before attaching it.");
+      const metadata = await ctx.db.system.get("_storage", args.imageStorageId);
+      if (!metadata || metadata.size > 5 * 1024 * 1024 || !["image/jpeg", "image/png", "image/webp"].includes(metadata.contentType ?? "")) throw new Error("Attach a JPEG, PNG or WebP image up to 5 MB.");
+      imageUrl = (await ctx.storage.getUrl(args.imageStorageId)) ?? undefined;
+    } else if (args.imageUrl?.startsWith("https://")) {
+      // Legacy showcase photos can display, but external URLs are never sent to AI.
+      imageUrl = args.imageUrl.slice(0, 2048);
+    }
+
     // Trusted reporters and event staff skip the moderation queue.
     const autoApprove =
       membership.role === "STAFF" || membership.role === "ORGANIZER" || membership.trustScore > 90;
@@ -165,7 +179,7 @@ export const create = mutation({
       resolved: false,
       clientId: args.clientId,
       imageStorageId: args.imageStorageId,
-      imageUrl: args.imageUrl,
+      imageUrl,
       createdAt: Date.now(),
     });
 
@@ -245,6 +259,9 @@ export const updateStatus = mutation({
       reviewedBy: moderator.userId,
       reviewedAt: Date.now(),
     });
+
+    const incidentLink = await ctx.db.query("incidentReports").withIndex("by_report", q => q.eq("reportId", report._id)).first();
+    if (incidentLink) await ctx.scheduler.runAfter(0, internal.orchestrator.onEvidenceUpdate, { incidentId: incidentLink.incidentId });
 
     if (args.status === "approved") {
       const reporter = await ctx.db
