@@ -5,7 +5,7 @@ import { logAgentAction } from "../lib/agentLog";
 
 const AUTO_ASSIGNABLE_TYPES = new Set(["volunteer", "general"]);
 
-function volunteersNeeded(riskScore: number) {
+export function volunteersNeeded(riskScore: number) {
   return riskScore >= 60 ? Math.max(1, Math.ceil((riskScore - 50) / 10)) : 0;
 }
 
@@ -20,7 +20,7 @@ export async function executeAutoAssignVolunteers(ctx: MutationCtx, eventId: Id<
   ]);
   const desired = new Map(zones.map((zone) => [
     zone._id,
-    zone.telemetryStale || zone.telemetryAt === undefined ? 0 : volunteersNeeded(zone.riskScore),
+    zone.telemetryStale || zone.telemetryAt === undefined ? 0 : volunteersNeeded(zone.unmitigatedRiskScore ?? zone.riskScore),
   ]));
   const assignedCounts = new Map<string, number>();
   for (const responder of responders) {
@@ -37,9 +37,9 @@ export async function executeAutoAssignVolunteers(ctx: MutationCtx, eventId: Id<
     const overallocated = count > (desired.get(responder.assignmentZoneId) ?? 0);
     const member = await ctx.db.get("memberships", responder.membershipId);
     const eligible = Boolean(member && member.eventId === eventId && member.userId === responder.userId && !member.isBanned && member.role !== "ATTENDEE");
-    if (!zoneStillNeedsPost || overallocated || !eligible || !AUTO_ASSIGNABLE_TYPES.has(responder.responderType)) {
+    if (!zoneStillNeedsPost || overallocated || !eligible || responder.currentTaskId || !AUTO_ASSIGNABLE_TYPES.has(responder.responderType)) {
       assignedCounts.set(responder.assignmentZoneId, Math.max(0, count - 1));
-      await ctx.db.patch("responders", responder._id, { isAvailable: true, assignmentZoneId: undefined, assignmentAssignedAt: undefined, updatedAt: Date.now() });
+      await ctx.db.patch("responders", responder._id, { isAvailable: eligible && !responder.currentTaskId, assignmentZoneId: undefined, assignmentAssignedAt: undefined, updatedAt: Date.now() });
       released++;
     }
   }
@@ -63,6 +63,19 @@ export async function executeAutoAssignVolunteers(ctx: MutationCtx, eventId: Id<
       assignedCounts.set(zone._id, (assignedCounts.get(zone._id) ?? 0) + 1);
       assigned++;
     }
+  }
+
+  // Recompute from the baseline each time: coverage must never compound or
+  // erase the demand that keeps marshals posted at the zone.
+  for (const zone of zones) {
+    const baseline = zone.unmitigatedRiskScore ?? zone.riskScore;
+    const count = assignedCounts.get(zone._id) ?? 0;
+    const reduction = zone.telemetryStale || zone.telemetryAt === undefined ? 0 : Math.min(20, count * 10);
+    const riskFactors = (zone.riskFactors ?? "").replace(/,? Marshal coverage:.*$/, "");
+    await ctx.db.patch("zones", zone._id, {
+      riskScore: Math.max(0, baseline - reduction),
+      riskFactors: reduction > 0 ? `${riskFactors}${riskFactors ? ", " : ""}Marshal coverage: ${count} assigned (-${reduction} points estimated risk)` : riskFactors,
+    });
   }
 
   if (assigned || released) {
@@ -208,13 +221,11 @@ export async function executePredictZoneRisk(ctx: MutationCtx, eventId: Id<"even
 
     const riskFactors = factors.length > 0 ? factors.join(", ") : "Normal flow";
 
-    const changed = zone.riskScore !== riskScore || zone.telemetryStale !== telemetryStale;
-    routingStateChanged ||= changed;
     await ctx.db.patch("zones", zone._id, {
       riskScore,
+      unmitigatedRiskScore: riskScore,
       riskFactors,
       telemetryStale,
-      ...(changed ? { updatedAt: Date.now() } : {}),
     });
 
     updatedZones.push({
@@ -225,6 +236,17 @@ export async function executePredictZoneRisk(ctx: MutationCtx, eventId: Id<"even
     });
   }
 
+  await executeAutoAssignVolunteers(ctx, eventId);
+  for (const result of updatedZones) {
+    const zone = (await ctx.db.get("zones", result.zoneId))!;
+    const previous = zones.find(z => z._id === result.zoneId)!;
+    result.riskScore = zone.riskScore;
+    result.riskFactors = zone.riskFactors ?? "Normal flow";
+    if (previous.riskScore !== zone.riskScore || previous.telemetryStale !== zone.telemetryStale) {
+      routingStateChanged = true;
+      await ctx.db.patch("zones", zone._id, { updatedAt: Date.now() });
+    }
+  }
   updatedZones.sort((a, b) => b.riskScore - a.riskScore);
   if (routingStateChanged) {
     const routes = await ctx.db.query("routeRecommendations").withIndex("by_event_active", q => q.eq("eventId", eventId).eq("isActive", true)).take(100);
@@ -264,12 +286,12 @@ export async function executeRecommendResourceAllocation(ctx: MutationCtx, event
     .withIndex("by_event", (q) => q.eq("eventId", eventId))
     .take(50);
 
-  const highRiskZones = zones.filter((z) => z.riskScore >= 60);
+  const highRiskZones = zones.filter((z) => (z.unmitigatedRiskScore ?? z.riskScore) >= 60);
   const recommendations = highRiskZones.map((z) => ({
     zoneId: z._id,
     zoneName: z.name,
     riskScore: z.riskScore,
-      additionalVolunteersNeeded: Math.max(1, Math.ceil((z.riskScore - 50) / 10)),
+      additionalVolunteersNeeded: volunteersNeeded(z.unmitigatedRiskScore ?? z.riskScore),
     recommendedAction:
       z.riskScore > 80
         ? "Immediate crowd diversion & perimeter control"
@@ -307,7 +329,6 @@ export const assessAllZones = internalMutation({
   handler: async (ctx, args) => {
     const riskResults = await executePredictZoneRisk(ctx, args.eventId);
     await executeRecommendResourceAllocation(ctx, args.eventId);
-    await executeAutoAssignVolunteers(ctx, args.eventId);
     return riskResults;
   },
 });

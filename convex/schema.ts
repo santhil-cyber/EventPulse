@@ -254,6 +254,8 @@ export default defineSchema({
     outflowRate: v.number(),
     /** Composite risk score computed by the Crowd Intelligence Agent (0-100). */
     riskScore: v.number(),
+    /** Risk before marshal coverage; used to keep staffing demand stable. */
+    unmitigatedRiskScore: v.optional(v.number()),
     /** JSON string listing the top risk contributors. */
     riskFactors: v.optional(v.string()),
     zoneType: zoneTypeValidator,

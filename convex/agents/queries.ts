@@ -1,3 +1,4 @@
+import { volunteersNeeded } from "./crowdIntel";
 import { v } from "convex/values";
 import { internal } from "../_generated/api";
 import { graphFingerprint, calculateRoute, pathCapacity } from "../lib/routeGraph";
@@ -115,9 +116,9 @@ export const listZonesWithRisk = query({
           flowTrend: netFlow > 5 ? "increasing" as const : netFlow < -5 ? "decreasing" as const : "stable" as const,
           projectedOccupancy,
           projectedDensity: zone.capacity > 0 ? Math.round((projectedOccupancy / zone.capacity) * 100) : 0,
-          additionalVolunteersNeeded: zone.telemetryStale || !zone.telemetryAt ? 0 : (zone.riskScore >= 60 ? Math.max(1, Math.ceil((zone.riskScore - 50) / 10)) : 0),
+          additionalVolunteersNeeded: zone.telemetryStale || !zone.telemetryAt ? 0 : volunteersNeeded(zone.unmitigatedRiskScore ?? zone.riskScore),
           assignedVolunteerCount: assignedCounts.get(zone._id) ?? 0,
-          volunteerShortfall: Math.max(0, (zone.telemetryStale || !zone.telemetryAt ? 0 : (zone.riskScore >= 60 ? Math.max(1, Math.ceil((zone.riskScore - 50) / 10)) : 0)) - (assignedCounts.get(zone._id) ?? 0)),
+          volunteerShortfall: Math.max(0, (zone.telemetryStale || !zone.telemetryAt ? 0 : volunteersNeeded(zone.unmitigatedRiskScore ?? zone.riskScore)) - (assignedCounts.get(zone._id) ?? 0)),
         };
       })
       .sort((a, b) => b.riskScore - a.riskScore);

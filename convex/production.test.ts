@@ -133,11 +133,61 @@ test("crowd intelligence automatically posts available volunteers and releases t
   await f.t.mutation(internal.agents.crowdIntel.assessAllZones, { eventId: f.eventId });
   expect((await f.t.run(ctx => ctx.db.get("responders", responderId)))?.assignmentZoneId).toBe(zoneId);
   expect((await f.t.run(ctx => ctx.db.get("responders", responderId)))?.isAvailable).toBe(false);
+  const covered = await f.t.run(ctx => ctx.db.get("zones", zoneId));
+  expect(covered?.riskScore).toBe(covered!.unmitigatedRiskScore! - 10);
+  expect(covered?.riskFactors).toContain("Marshal coverage: 1 assigned");
+  const coverage = await f.staff.query(api.agents.queries.listZonesWithRisk, { eventId: f.eventId });
+  expect(coverage[0].additionalVolunteersNeeded).toBe(4);
+  expect(coverage[0].volunteerShortfall).toBe(3);
+  await f.t.mutation(internal.agents.crowdIntel.assessAllZones, { eventId: f.eventId });
+  expect((await f.t.run(ctx => ctx.db.get("zones", zoneId)))?.riskScore).toBe(covered?.riskScore);
+  expect((await f.t.run(ctx => ctx.db.get("responders", responderId)))?.assignmentZoneId).toBe(zoneId);
+
+  // Invalid staff cannot keep contributing coverage.
+  await f.t.run(ctx => ctx.db.patch("memberships", f.membershipId, { isBanned: true }));
+  await f.t.mutation(internal.agents.crowdIntel.assessAllZones, { eventId: f.eventId });
+  const uncovered = await f.t.run(ctx => ctx.db.get("zones", zoneId));
+  expect(uncovered?.riskScore).toBe(uncovered?.unmitigatedRiskScore);
+  await f.t.run(async ctx => {
+    await ctx.db.patch("memberships", f.membershipId, { isBanned: false });
+    await ctx.db.patch("responders", responderId, { isAvailable: true });
+  });
+  await f.t.mutation(internal.agents.crowdIntel.assessAllZones, { eventId: f.eventId });
+
+  // Stale telemetry removes estimated coverage benefits and releases the post.
+  await f.t.run(ctx => ctx.db.patch("zones", zoneId, { telemetryAt: Date.now() - 120_001 }));
+  await f.t.mutation(internal.agents.crowdIntel.assessAllZones, { eventId: f.eventId });
+  const stale = await f.t.run(ctx => ctx.db.get("zones", zoneId));
+  expect(stale?.riskScore).toBe(stale?.unmitigatedRiskScore);
+  expect((await f.t.run(ctx => ctx.db.get("responders", responderId)))?.assignmentZoneId).toBeUndefined();
 
   await f.t.run(ctx => ctx.db.patch("zones", zoneId, { currentOccupancy: 10, inflowRate: 0, outflowRate: 10, exitBlocked: false, telemetryAt: Date.now() }));
   await f.t.mutation(internal.agents.crowdIntel.assessAllZones, { eventId: f.eventId });
   expect((await f.t.run(ctx => ctx.db.get("responders", responderId)))?.assignmentZoneId).toBeUndefined();
   expect((await f.t.run(ctx => ctx.db.get("responders", responderId)))?.isAvailable).toBe(true);
+});
+
+test("marshal risk reduction is capped and applies only to the designated zone", async () => {
+  const f = await fixture();
+  const { crowded, quiet } = await f.t.run(async ctx => {
+    const base = { eventId: f.eventId, pinX: 20, pinY: 20, capacity: 100, currentOccupancy: 100, inflowRate: 20, outflowRate: 0, riskScore: 0, zoneType: "gate" as const, exitBlocked: true, isNarrowPassage: false, telemetryAt: Date.now(), telemetryStale: false, updatedAt: Date.now() };
+    const crowded = await ctx.db.insert("zones", { ...base, name: "Crowded gate" });
+    const quiet = await ctx.db.insert("zones", { ...base, name: "Quiet gate", currentOccupancy: 10, inflowRate: 0, exitBlocked: false });
+    for (let i = 0; i < 3; i++) {
+      const userId = await ctx.db.insert("users", { name: `Marshal ${i}` });
+      const membershipId = await ctx.db.insert("memberships", { eventId: f.eventId, userId, role: "STAFF", isBanned: false, trustScore: 100, joinedAt: Date.now() });
+      await ctx.db.insert("responders", { eventId: f.eventId, userId, membershipId, responderType: "volunteer", hasFirstAid: false, hasFireTraining: false, isAvailable: true, updatedAt: Date.now() });
+    }
+    return { crowded, quiet };
+  });
+  const results = await f.t.mutation(internal.agents.crowdIntel.assessAllZones, { eventId: f.eventId });
+  const zone = await f.t.run(ctx => ctx.db.get("zones", crowded));
+  expect(zone?.riskScore).toBe(zone!.unmitigatedRiskScore! - 20);
+  expect(results.find(z => z.zoneId === crowded)?.riskScore).toBe(zone?.riskScore);
+  const other = await f.t.run(ctx => ctx.db.get("zones", quiet));
+  expect(other?.riskScore).toBe(other?.unmitigatedRiskScore);
+  await f.t.mutation(internal.agents.crowdIntel.assessAllZones, { eventId: f.eventId });
+  expect((await f.t.run(ctx => ctx.db.get("zones", crowded)))?.riskScore).toBe(zone?.riskScore);
 });
 
 test("shadow analysis records suggestions without changing incident or verification", async () => {
