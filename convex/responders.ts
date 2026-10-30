@@ -26,6 +26,26 @@ export const eligibleMembers = query({
   },
 });
 
+/**
+ * Whether this caller's phone should ring for new incidents. Only STAFF
+ * memberships ring; organizers watch the Command view instead. A staff member
+ * the organizer marked off duty (unavailable with no task or zone post) is
+ * muted. Staff without a responder profile are on duty by default.
+ */
+export const myAlertStatus = query({
+  args: { eventId: v.id("events") },
+  handler: async (ctx, { eventId }) => {
+    const member = await requireRole(ctx, eventId, ["ORGANIZER", "STAFF", "ATTENDEE"]);
+    if (member.role !== "STAFF") return { ring: false, reason: "not_staff" as const };
+    const event = await ctx.db.get("events", eventId);
+    if (!event?.isActive) return { ring: false, reason: "event_inactive" as const };
+    const responder = await ctx.db.query("responders").withIndex("by_user_event", q => q.eq("userId", member.userId).eq("eventId", eventId)).first();
+    const offDuty = responder !== null && !responder.isAvailable && !responder.currentTaskId && !responder.assignmentZoneId;
+    if (offDuty) return { ring: false, reason: "off_duty" as const };
+    return { ring: true, reason: "on_duty" as const };
+  },
+});
+
 export async function scheduleDispatchReview(ctx: MutationCtx, eventId: Id<"events">) {
   await ctx.scheduler.runAfter(0, internal.responders.reviewWaiting, { eventId });
   await ctx.scheduler.runAfter(0, internal.agents.crowdIntel.assessAllZones, { eventId });

@@ -624,6 +624,10 @@ function NotificationPanel({ notifications, onClose, onDismiss }: { notification
 // ─────────────────────────────────────────────────────────────────────────────
 const STAFF_SOUND_KEY = "eventpulse.staffEmergencySound";
 const STAFF_NOTIFICATION_KEY = "eventpulse.staffPhoneNotifications";
+/** The phone keeps ringing until the staff member acknowledges, up to this long. */
+const RING_TIMEOUT_MS = 45_000;
+const RING_INTERVAL_MS = 1_600;
+const RING_VIBRATION = [400, 150, 400, 150, 400];
 
 function readPreference(key: string): boolean {
   try { return window.localStorage.getItem(key) === "1"; } catch { return false; }
@@ -634,6 +638,37 @@ function writePreference(key: string, value: boolean): void {
     if (value) window.localStorage.setItem(key, "1");
     else window.localStorage.removeItem(key);
   } catch { /* private browsing can disable local storage */ }
+}
+
+/** Registers public/sw.js. Android Chrome shows notifications only through it. */
+async function getAlertServiceWorker(): Promise<ServiceWorkerRegistration | null> {
+  if (typeof navigator === "undefined" || !("serviceWorker" in navigator)) return null;
+  try {
+    await navigator.serviceWorker.register("/sw.js");
+    return await navigator.serviceWorker.ready;
+  } catch {
+    return null;
+  }
+}
+
+async function showIncidentNotification(incident: IncidentAlertRow): Promise<void> {
+  const title = `Emergency incident · ${incident.incidentCode}`;
+  // vibrate and renotify are valid for service worker notifications but are
+  // missing from TypeScript's NotificationOptions.
+  const options = {
+    body: `${incident.severity.toUpperCase()} at ${incident.location}: ${incident.description}`,
+    tag: `eventpulse-${incident._id}`,
+    requireInteraction: true,
+    renotify: true,
+    vibrate: RING_VIBRATION,
+    icon: "/favicon.svg",
+  } as NotificationOptions;
+  const registration = await getAlertServiceWorker();
+  if (registration) {
+    await registration.showNotification(title, options);
+    return;
+  }
+  new Notification(title, options);
 }
 
 /** A short, unmistakable three-tone alarm. Mobile browsers require a prior tap. */
@@ -665,7 +700,12 @@ function playEmergencyTone(context: AudioContext): void {
   window.setTimeout(() => gain.disconnect(), 1400);
 }
 
-function StaffEmergencyAlerts({ incidents }: { incidents: IncidentAlertRow[] }) {
+function StaffEmergencyAlerts({ incidents, armed, offDuty }: {
+  incidents: IncidentAlertRow[] | undefined;
+  /** True only for an on-duty STAFF account (responders.myAlertStatus). */
+  armed: boolean;
+  offDuty: boolean;
+}) {
   // The preference is remembered for copy and diagnostics, but the Web Audio
   // output must be unlocked by a tap on every mobile browser session.
   const [soundEnabled, setSoundEnabled] = useState(false);
@@ -677,16 +717,58 @@ function StaffEmergencyAlerts({ incidents }: { incidents: IncidentAlertRow[] }) 
   const [lastAlertAt, setLastAlertAt] = useState<number | null>(null);
   const previousIds = useRef<Set<string> | null>(null);
   const audioContext = useRef<AudioContext | null>(null);
+  const ringInterval = useRef<number | null>(null);
+  const ringTimeout = useRef<number | null>(null);
+
+  const stopRinging = useCallback(() => {
+    if (ringInterval.current !== null) window.clearInterval(ringInterval.current);
+    if (ringTimeout.current !== null) window.clearTimeout(ringTimeout.current);
+    ringInterval.current = null;
+    ringTimeout.current = null;
+    if (typeof navigator !== "undefined" && "vibrate" in navigator) navigator.vibrate(0);
+  }, []);
+
+  const acknowledge = useCallback(() => {
+    stopRinging();
+    setActiveAlert(null);
+  }, [stopRinging]);
+
+  /** Rings like a phone call: tone and vibration repeat until acknowledged. */
+  const startRinging = useCallback((withSound: boolean) => {
+    stopRinging();
+    const ring = () => {
+      if (typeof navigator !== "undefined" && "vibrate" in navigator) navigator.vibrate(RING_VIBRATION);
+      if (withSound && audioContext.current) playEmergencyTone(audioContext.current);
+    };
+    ring();
+    ringInterval.current = window.setInterval(ring, RING_INTERVAL_MS);
+    ringTimeout.current = window.setTimeout(stopRinging, RING_TIMEOUT_MS);
+  }, [stopRinging]);
 
   const ensureAudio = useCallback(async () => {
     if (!audioContext.current) {
       const AudioContextCtor = window.AudioContext ??
         (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
       if (!AudioContextCtor) throw new Error("Audio is not supported on this phone.");
+      // iOS 17+: "playback" lets the alarm sound even with the ring/silent switch on silent.
+      const session = (navigator as Navigator & { audioSession?: { type: string } }).audioSession;
+      if (session) session.type = "playback";
       audioContext.current = new AudioContextCtor();
     }
     if (audioContext.current.state === "suspended") await audioContext.current.resume();
     return audioContext.current;
+  }, []);
+
+  const requestPhoneNotifications = useCallback(async () => {
+    if (typeof Notification === "undefined") return;
+    const nextPermission = Notification.permission === "default"
+      ? await Notification.requestPermission()
+      : Notification.permission;
+    setPermission(nextPermission);
+    const enabled = nextPermission === "granted";
+    setPhoneEnabled(enabled);
+    writePreference(STAFF_NOTIFICATION_KEY, enabled);
+    if (enabled) void getAlertServiceWorker();
   }, []);
 
   const enableAlerts = useCallback(async () => {
@@ -705,38 +787,57 @@ function StaffEmergencyAlerts({ incidents }: { incidents: IncidentAlertRow[] }) 
     } catch {
       setSoundEnabled(false);
     }
-
-    if (typeof Notification !== "undefined") {
-      const nextPermission = Notification.permission === "default"
-        ? await Notification.requestPermission()
-        : Notification.permission;
-      setPermission(nextPermission);
-      const enabled = nextPermission === "granted";
-      setPhoneEnabled(enabled);
-      writePreference(STAFF_NOTIFICATION_KEY, enabled);
-    }
-  }, [ensureAudio]);
+    await requestPhoneNotifications();
+  }, [ensureAudio, requestPhoneNotifications]);
 
   const testSound = useCallback(async () => {
     try { playEmergencyTone(await ensureAudio()); } catch { setSoundEnabled(false); }
+    if (typeof navigator !== "undefined" && "vibrate" in navigator) navigator.vibrate(RING_VIBRATION);
   }, [ensureAudio]);
 
-  const enablePhoneNotifications = useCallback(async () => {
-    if (typeof Notification === "undefined") return;
-    const nextPermission = Notification.permission === "default"
-      ? await Notification.requestPermission()
-      : Notification.permission;
-    setPermission(nextPermission);
-    const enabled = nextPermission === "granted";
-    setPhoneEnabled(enabled);
-    writePreference(STAFF_NOTIFICATION_KEY, enabled);
-  }, []);
-
   useEffect(() => () => {
+    stopRinging();
     void audioContext.current?.close();
-  }, []);
+  }, [stopRinging]);
+
+  // Register the worker early when permission already exists from a past visit.
+  useEffect(() => {
+    if (armed && phoneEnabled && permission === "granted") void getAlertServiceWorker();
+  }, [armed, phoneEnabled, permission]);
+
+  // Going off duty (or losing the STAFF role) silences a ring in progress.
+  useEffect(() => {
+    if (!armed) stopRinging();
+  }, [armed, stopRinging]);
+
+  // Keep the screen awake while armed so the demo phone does not lock and
+  // suspend the page. The browser drops the lock when the tab is hidden, so it
+  // is requested again on return.
+  useEffect(() => {
+    if (!armed || !soundEnabled || typeof navigator === "undefined" || !("wakeLock" in navigator)) return;
+    let lock: WakeLockSentinel | null = null;
+    let cancelled = false;
+    const acquire = async () => {
+      if (document.visibilityState !== "visible" || (lock && !lock.released)) return;
+      try {
+        const next = await navigator.wakeLock.request("screen");
+        if (cancelled) void next.release();
+        else lock = next;
+      } catch { /* low battery mode or an unsupported browser refuses the lock */ }
+    };
+    void acquire();
+    const onVisibility = () => { void acquire(); };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      cancelled = true;
+      document.removeEventListener("visibilitychange", onVisibility);
+      void lock?.release();
+    };
+  }, [armed, soundEnabled]);
 
   useEffect(() => {
+    // Wait for the first real result, otherwise the loading state would become
+    // the baseline and every existing incident would ring.
     if (!incidents) return;
     const active = incidents.filter((incident) => !incident.isResolved);
     const ids = new Set(active.map((incident) => incident._id));
@@ -747,26 +848,33 @@ function StaffEmergencyAlerts({ incidents }: { incidents: IncidentAlertRow[] }) 
     const fresh = active.filter((incident) => !previousIds.current!.has(incident._id));
     previousIds.current = ids;
     const incident = fresh.sort((a, b) => b.createdAt - a.createdAt)[0];
-    if (!incident) return;
+    if (!incident || !armed) return;
 
     setActiveAlert(incident);
     setLastAlertAt(Date.now());
-    if (typeof navigator !== "undefined" && "vibrate" in navigator) {
-      navigator.vibrate([300, 150, 300, 150, 700]);
-    }
-    if (soundEnabled && audioContext.current) playEmergencyTone(audioContext.current);
+    startRinging(soundEnabled);
     if (phoneEnabled && permission === "granted" && typeof Notification !== "undefined") {
-      try {
-        new Notification(`Emergency incident · ${incident.incidentCode}`, {
-          body: `${incident.severity.toUpperCase()} at ${incident.location}: ${incident.description}`,
-          tag: `eventpulse-${incident._id}`,
-          requireInteraction: true,
-        });
-      } catch { /* browser may revoke notification permission while the app is open */ }
+      // The browser may revoke notification permission while the app is open.
+      void showIncidentNotification(incident).catch(() => undefined);
     }
-    const timeout = window.setTimeout(() => setActiveAlert(null), 15000);
-    return () => window.clearTimeout(timeout);
-  }, [incidents, permission, phoneEnabled, soundEnabled]);
+  }, [incidents, armed, permission, phoneEnabled, soundEnabled, startRinging]);
+
+  if (offDuty) {
+    return (
+      <div className="absolute top-3 left-3 right-3 z-[45] pointer-events-none flex flex-col gap-2">
+        <div className="pointer-events-auto rounded-2xl px-3 py-2.5 shadow-lg" style={{ background: "rgba(250,248,245,0.97)", border: "1px solid rgba(0,0,0,0.12)", backdropFilter: "blur(14px)" }}>
+          <div className="flex items-center gap-2">
+            <span className="text-base" aria-hidden="true">🔕</span>
+            <div className="min-w-0 flex-1">
+              <p className="text-[11px] font-bold" style={{ color: ink }}>You are off duty</p>
+              <p className="text-[10px] leading-snug" style={{ color: muted }}>Incident alerts are paused until the organizer marks you available.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+  if (!armed) return null;
 
   const severityColor = activeAlert?.severity === "critical" ? "#b91c1c" : activeAlert?.severity === "high" ? "#c2410c" : "#a16207";
   return (
@@ -777,18 +885,18 @@ function StaffEmergencyAlerts({ incidents }: { incidents: IncidentAlertRow[] }) 
           <div className="min-w-0 flex-1">
             <p className="text-[11px] font-bold" style={{ color: ink }}>Staff emergency alerts</p>
             <p className="text-[10px] leading-snug" style={{ color: muted }}>
-              {soundEnabled ? "Sound is armed for new incidents." : "Enable sound so this phone rings for new incidents."}
+              {soundEnabled ? "This phone will ring for new incidents. Keep this screen open." : "Enable sound so this phone rings for new incidents."}
               {phoneEnabled ? " Phone notifications are on." : ""}
             </p>
           </div>
           {!soundEnabled && <button onClick={() => void enableAlerts()} className="shrink-0 rounded-xl px-3 py-2 text-[10px] font-bold text-white" style={{ background: "#dc2626" }}>Enable sound</button>}
-          {soundEnabled && <button onClick={() => void testSound()} className="shrink-0 rounded-xl px-2.5 py-2 text-[10px] font-semibold" style={{ background: "rgba(16,185,129,0.12)", color: "#047857" }}>Test sound</button>}
-          {soundEnabled && !phoneEnabled && permission !== "denied" && <button onClick={() => void enablePhoneNotifications()} className="shrink-0 rounded-xl px-2.5 py-2 text-[10px] font-semibold" style={{ background: "rgba(91,63,248,0.1)", color: accent }}>Enable phone</button>}
+          {soundEnabled && <button onClick={() => void testSound()} className="shrink-0 rounded-xl px-2.5 py-2 text-[10px] font-semibold" style={{ background: "rgba(16,185,129,0.12)", color: "#047857" }}>Test ring</button>}
+          {soundEnabled && !phoneEnabled && permission !== "denied" && permission !== "unsupported" && <button onClick={() => void requestPhoneNotifications()} className="shrink-0 rounded-xl px-2.5 py-2 text-[10px] font-semibold" style={{ background: "rgba(91,63,248,0.1)", color: accent }}>Enable phone</button>}
         </div>
-        {soundEnabled && permission === "denied" && <p className="text-[10px] mt-1.5" style={{ color: "#b91c1c" }}>Phone notifications are blocked by the browser. Allow them in site settings; the in-app banner and sound remain active.</p>}
+        {soundEnabled && permission === "denied" && <p className="text-[10px] mt-1.5" style={{ color: "#b91c1c" }}>Phone notifications are blocked by the browser. Allow them in site settings; the in-app banner and ring remain active.</p>}
       </div>
       {activeAlert && (
-        <div className="pointer-events-auto rounded-2xl px-4 py-3 shadow-xl text-white" style={{ background: severityColor, border: "1px solid rgba(255,255,255,0.4)" }}>
+        <div className="pointer-events-auto rounded-2xl px-4 py-3 shadow-xl text-white animate-pulse" style={{ background: severityColor, border: "1px solid rgba(255,255,255,0.4)" }}>
           <div className="flex items-start gap-3">
             <span className="text-xl leading-none" aria-hidden="true">🚨</span>
             <div className="min-w-0 flex-1">
@@ -797,8 +905,8 @@ function StaffEmergencyAlerts({ incidents }: { incidents: IncidentAlertRow[] }) 
               <p className="text-xs mt-0.5 leading-snug">{activeAlert.description}</p>
               <p className="text-[10px] mt-2 opacity-80">Staff response workflow has started. Check Command for assignment details.</p>
             </div>
-            <button onClick={() => setActiveAlert(null)} className="text-white/80 text-lg leading-none" aria-label="Dismiss emergency alert">×</button>
           </div>
+          <button onClick={acknowledge} className="mt-3 w-full rounded-xl py-2.5 text-xs font-bold" style={{ background: "white", color: severityColor }}>Acknowledge</button>
         </div>
       )}
       {lastAlertAt && !activeAlert && <span className="sr-only">Last new incident alert at {new Date(lastAlertAt).toLocaleTimeString()}</span>}
@@ -3300,6 +3408,8 @@ export default function App() {
   // This is a reactive Convex query. A staff phone therefore receives the
   // alert as soon as intake creates the incident, without polling.
   const incidentRows = useQuery(api.agents.queries.listIncidents, activeEventId && isModerator ? { eventId: activeEventId } : "skip");
+  // Only an on-duty STAFF account rings; organizers never get the phone alert.
+  const alertStatus = useQuery(api.responders.myAlertStatus, activeEventId && activeMembership?.role === "STAFF" ? { eventId: activeEventId } : "skip");
   const routeNow = useNowAtBoundaries([]);
   const publicRoutes = useQuery(api.agents.queries.listPublicRoutes, activeEventId ? { eventId: activeEventId, now: routeNow } : "skip");
 
@@ -3870,7 +3980,13 @@ export default function App() {
           // Same shell as the attendee workspace; the laptop panel is the
           // reports queue.
           <div className="flex-1 flex flex-col min-h-0 relative lg:flex-row lg:gap-6 lg:p-6">
-            <StaffEmergencyAlerts incidents={(incidentRows ?? []) as IncidentAlertRow[]} />
+            {role === "staff" && (
+              <StaffEmergencyAlerts
+                incidents={incidentRows as IncidentAlertRow[] | undefined}
+                armed={alertStatus?.ring === true}
+                offDuty={alertStatus?.reason === "off_duty"}
+              />
+            )}
             <SideNav items={staffNav.filter((i) => i.id !== "reports")} active={staffTab} onChange={setStaffTab} />
             <div className={`flex-1 flex flex-col min-h-0 relative sm:p-6 lg:p-0 ${staffTab === "command" ? "lg:flex-1" : "lg:flex-none lg:aspect-[390/811.5]"}`}>
             {staffTab === "command" && (

@@ -472,3 +472,21 @@ test("available responder can take a waiting incident but cannot be double-booke
   await f.staff.mutation(api.responders.retryWaiting,{eventId:f.eventId});
   expect(await f.t.mutation(internal.agents.dispatch.dispatchResponders,{incidentId:incident.incidentId,allowEmergencyServices:false})).toBe(taskId);
 });
+
+test("only on-duty staff phones ring for incidents", async () => {
+  const f = await fixture();
+  const staffUser = await f.t.run(async ctx => {
+    const userId = await ctx.db.insert("users", { name:"Staff" });
+    const membershipId = await ctx.db.insert("memberships", { eventId:f.eventId,userId,role:"STAFF",isBanned:false,trustScore:100,joinedAt:Date.now() });
+    return { userId, membershipId };
+  });
+  const staffClient = f.t.withIdentity({ subject:staffUser.userId });
+  expect(await f.staff.query(api.responders.myAlertStatus,{eventId:f.eventId})).toEqual({ ring:false,reason:"not_staff" });
+  expect(await f.attendeeClient.query(api.responders.myAlertStatus,{eventId:f.eventId})).toEqual({ ring:false,reason:"not_staff" });
+  expect(await staffClient.query(api.responders.myAlertStatus,{eventId:f.eventId})).toEqual({ ring:true,reason:"on_duty" });
+  const responderId = await f.staff.mutation(api.responders.register,{ eventId:f.eventId,membershipId:staffUser.membershipId,name:"Staff",responderType:"medical",hasFirstAid:true,hasFireTraining:false,isAvailable:false });
+  expect(await staffClient.query(api.responders.myAlertStatus,{eventId:f.eventId})).toEqual({ ring:false,reason:"off_duty" });
+  await f.staff.mutation(api.responders.setAvailability,{ responderId,isAvailable:true });
+  expect(await staffClient.query(api.responders.myAlertStatus,{eventId:f.eventId})).toEqual({ ring:true,reason:"on_duty" });
+  await expect(f.outsiderClient.query(api.responders.myAlertStatus,{eventId:f.eventId})).rejects.toThrow();
+});
