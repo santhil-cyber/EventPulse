@@ -20,11 +20,14 @@ export const check_source_independence = internalQuery({
       .withIndex("by_incident", (q) => q.eq("incidentId", args.incidentId))
       .take(100);
 
+    const original = links[0] ? await ctx.db.get("reports", links[0].reportId) : null;
+    const groupRejected = original?.status === "rejected";
     const reportIds = links.map((l) => l.reportId);
     const reports: Doc<"reports">[] = [];
     for (const rId of reportIds) {
       const rep = await ctx.db.get("reports", rId);
-      if (rep && rep.eventId === incident.eventId && rep.status !== "rejected") reports.push(rep);
+      if (rep && rep.eventId === incident.eventId && rep.status !== "rejected"
+        && !groupRejected) reports.push(rep);
     }
 
     const reporterUserIds = Array.from(new Set(reports.map((r) => r.reporterId)));
@@ -201,11 +204,13 @@ export const evaluateIncident = internalMutation({
       .withIndex("by_incident", (q) => q.eq("incidentId", args.incidentId))
       .take(100);
 
+    const original = links[0] ? await ctx.db.get("reports", links[0].reportId) : null;
+    const groupRejected = original?.status === "rejected";
     const reportIds = links.map((l) => l.reportId);
     const reports: Doc<"reports">[] = [];
     for (const rId of reportIds) {
       const rep = await ctx.db.get("reports", rId);
-      if (rep) reports.push(rep);
+      if (rep && !groupRejected) reports.push(rep);
     }
 
     if (incident.isResolved) return { previousStatus: incident.verificationStatus, newStatus: incident.verificationStatus, independentCount: 0, avgTrustScore: 0 };

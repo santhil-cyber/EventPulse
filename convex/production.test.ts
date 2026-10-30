@@ -8,6 +8,7 @@ import { api, internal } from "./_generated/api";
 import { inputHash } from "./ai/state";
 import { calculateRoute, emptyReservations, pathCapacity, reservePath } from "./lib/routeGraph";
 import { rankResponders } from "./lib/dispatchPolicy";
+import { sourcePriority } from "./lib/reportGroup";
 import { duplicateScore } from "./lib/dedup";
 import { classifyIncident } from "./lib/intakeRules";
 import { hasExactQuote, splitKnowledge, validateEmbedding } from "./ai/policy";
@@ -606,4 +607,74 @@ test.each(["off", "distant", "resolved", "other-event", "low-confidence"])("sema
   const reportId = await f.t.run(ctx => ctx.db.insert("reports",{eventId:f.eventId,reporterId:f.attendee,description:"Flames visible beside the doorway",location:"Pinned on map",pinX:boundary === "distant" ? 80 : 20,pinY:20,status:"pending",views:0,resolved:false,clientId:`semantic-${boundary}`,createdAt:Date.now()}));
   const b = await f.t.mutation(internal.agents.intake.processReport,{reportId,matchedIncidentId:a.incidentId,similarityScore:boundary === "low-confidence" ? 0.8 : 0.98});
   expect(b.incidentId).not.toBe(a.incidentId);
+});
+
+test("different attendees share the first report card, one approval and a unique-person count", async () => {
+  const f = await fixture();
+  const first = await intake(f);
+  const secondId = await f.t.run(async ctx => {
+    const userId = await ctx.db.insert("users", {name:"Second attendee"});
+    await ctx.db.insert("memberships", {eventId:f.eventId,userId,role:"ATTENDEE",isBanned:false,trustScore:60,joinedAt:Date.now()});
+    return ctx.db.insert("reports", {eventId:f.eventId,reporterId:userId,description:"Smoke rising near entrance",location:"Pinned on map",pinX:20,pinY:20,status:"pending",views:0,resolved:false,clientId:"second-person",createdAt:Date.now()+10_000});
+  });
+  await f.t.mutation(internal.agents.intake.processReport,{reportId:secondId});
+  let cards = await f.staff.query(api.reports.listForStaff,{eventId:f.eventId});
+  expect(cards).toHaveLength(1);
+  expect(cards[0]).toMatchObject({id:f.reportId,reporterCount:2,status:"pending"});
+  // Moderation invoked through any report applies to the original issue.
+  await f.staff.mutation(api.reports.updateStatus,{reportId:secondId,status:"approved"});
+  cards = await f.staff.query(api.reports.listForStaff,{eventId:f.eventId});
+  expect(cards[0]).toMatchObject({id:f.reportId,status:"approved",reporterCount:2});
+  const second = await f.t.run(ctx=>ctx.db.get("reports",secondId));
+  const ownCards = await f.t.withIdentity({subject:second!.reporterId}).query(api.reports.listForEvent,{eventId:f.eventId});
+  expect(ownCards).toHaveLength(1);
+  expect(ownCards[0]).toMatchObject({id:f.reportId,isMine:true,status:"approved",reporterCount:2});
+  const repeatId = await f.t.run(ctx => ctx.db.insert("reports", {
+    eventId:f.eventId,reporterId:second!.reporterId,description:"Smoke rising near entrance",
+    location:"Pinned on map",pinX:20,pinY:20,status:"pending",views:0,resolved:false,
+    clientId:"repeat-evidence",createdAt:Date.now(),
+  }));
+  await f.t.mutation(internal.agents.intake.processReport,{reportId:repeatId});
+  expect((await f.staff.query(api.reports.listForStaff,{eventId:f.eventId}))[0]).toMatchObject({reporterCount:2,status:"approved"});
+  const sources = await f.t.query(internal.agents.verification.check_source_independence,{incidentId:first.incidentId});
+  expect(sources.independentCount).toBe(2);
+});
+
+test("reporter volume suggests urgency without changing staff priority and rejected groups lose corroboration", async () => {
+  const f = await fixture(); const first = await intake(f);
+  for (let i=0;i<4;i++) {
+    const reportId = await f.t.run(async ctx => {
+      const userId = await ctx.db.insert("users",{name:`Witness ${i}`});
+      await ctx.db.insert("memberships",{eventId:f.eventId,userId,role:"ATTENDEE",isBanned:i===3,trustScore:60,joinedAt:Date.now()});
+      return ctx.db.insert("reports",{eventId:f.eventId,reporterId:userId,description:"Smoke rising near entrance",location:"Pinned on map",pinX:20,pinY:20,status:"pending",views:0,resolved:false,clientId:`witness-${i}`,createdAt:Date.now()});
+    });
+    await f.t.mutation(internal.agents.intake.processReport,{reportId});
+  }
+  let cards = await f.staff.query(api.reports.listForStaff,{eventId:f.eventId});
+  expect(cards).toHaveLength(1);
+  expect(cards[0]).toMatchObject({reporterCount:4,suggestedPriority:"high"});
+  expect(cards[0].priority).toBeUndefined();
+  await f.staff.mutation(api.reports.updateStatus,{reportId:f.reportId,status:"rejected"});
+  cards = await f.staff.query(api.reports.listForStaff,{eventId:f.eventId});
+  expect(cards[0]).toMatchObject({status:"rejected",reporterCount:0,suggestedPriority:null});
+  const sources = await f.t.query(internal.agents.verification.check_source_independence,{incidentId:first.incidentId});
+  expect(sources.independentCount).toBe(0);
+  const verification = await f.t.mutation(internal.agents.verification.evaluateIncident,{incidentId:first.incidentId});
+  expect(verification.independentCount).toBe(0);
+});
+
+test("resolution applies to the grouped issue and its card", async () => {
+  const f=await fixture();const incident=await intake(f);
+  await f.staff.mutation(api.reports.updateStatus,{reportId:f.reportId,status:"approved"});
+  await f.staff.mutation(api.reports.updateStatus,{reportId:f.reportId,status:"resolved"});
+  expect((await f.staff.query(api.reports.listForStaff,{eventId:f.eventId}))[0].resolved).toBe(true);
+  expect((await f.t.run(ctx=>ctx.db.get("incidents",incident.incidentId)))?.isResolved).toBe(true);
+});
+
+
+test("reporter count urgency thresholds preserve single-source uncertainty", () => {
+  expect(sourcePriority(1)).toBeNull();
+  expect(sourcePriority(2)).toBeNull();
+  expect(sourcePriority(3)).toBe("high");
+  expect(sourcePriority(5)).toBe("critical");
 });

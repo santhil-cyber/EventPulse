@@ -174,3 +174,24 @@ Linked repeat reports by the same reporter and moderation state collapse to one
 feed card. Original report documents and incident links remain available to the
 verification agent. Distinct reporters remain separate evidence; a repeated
 submission by one account never increases the independent-source count.
+
+
+### One card and one moderation decision per issue
+
+Reports linked to the same incident now display on the original report card,
+including reports from different attendees. The card counts unique eligible
+accounts; banned users, rejected evidence, and repeated submissions by the same
+account do not increase the count. The original report ID, text and map pin stay
+stable. A contributing attendee sees the grouped card in My Reports.
+
+Approval, rejection, priority and official statements belong to the original
+card. Later matching reports use that existing decision automatically in the
+feed. Rejecting the issue excludes its evidence from corroboration. Resolving
+the card also resolves the incident. Individual evidence documents remain
+preserved; no repeated moderation or repeated trust-score award is required.
+
+Staff see suggested high priority at 3 unique reporters and suggested critical
+priority at 5. These are count-based review recommendations, not automatic
+severity changes or verification. An explicit staff priority takes precedence
+in sorting; counts break ties. Groups display up to 1,000 evidence records; the
+UI marks the count with + when it is a lower bound.

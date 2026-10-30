@@ -119,6 +119,7 @@ interface Report {
   priority?: Priority; views: number; officialStatement?: string;
   createdAt: number; authorTrustScore: number; isMine: boolean;
   reviewedByMe: boolean; reviewedAt?: number;
+  reporterCount?: number; reportCount?: number; countIsLowerBound?: boolean; suggestedPriority?: "high" | "critical" | null;
 }
 
 /**
@@ -448,6 +449,18 @@ interface PinModeration {
   onSetCritical: (report: Report) => void;
 }
 
+function ReportCount({ report, showSuggestion = false }: { report: Report; showSuggestion?: boolean }) {
+  const count = report.reporterCount ?? 1;
+  return <div className="flex flex-wrap items-center gap-2 my-2">
+    <span className="text-[11px] font-semibold rounded-full px-2.5 py-1" style={{ background: "rgba(99,73,160,0.1)", color: accent }}>
+      {count}{report.countIsLowerBound ? "+" : ""} {count === 1 ? "person reported" : "people reported"} this issue
+    </span>
+    {showSuggestion && report.suggestedPriority && <span className="text-[10px] font-semibold" style={{ color: "#b45309" }}>
+      Suggested {report.suggestedPriority} priority · review reporter count
+    </span>}
+  </div>;
+}
+
 function ReportPinDetailSheet({ report, onClose, moderation }: { report: Report; onClose: () => void; moderation?: PinModeration }) {
   // Only the moves the state machine allows from "pending": set a priority
   // (critical = approve with a statement), approve, or reject.
@@ -475,6 +488,7 @@ function ReportPinDetailSheet({ report, onClose, moderation }: { report: Report;
         </div>
         <p className="text-[11px] font-mono mb-1" style={{ color: muted }}>{report.location}</p>
         <p className="text-base font-semibold leading-snug mb-3" style={{ color: ink }}>{report.description}</p>
+        <ReportCount report={report} showSuggestion={!!moderation} />
         {report.officialStatement && (
           <div className="rounded-2xl p-3.5 mb-3" style={{ background: "rgba(220,38,38,0.06)", border: "1px solid rgba(220,38,38,0.18)" }}>
             <div className="flex items-center gap-1.5 mb-1.5">
@@ -516,12 +530,12 @@ function ReportPinDetailSheet({ report, onClose, moderation }: { report: Report;
               <button onClick={() => { moderation.onApprove(report.id); onClose(); }} className="flex-1 py-2 rounded-xl text-xs font-semibold flex items-center justify-center gap-1.5"
                 style={{ background: "rgba(22,163,74,0.1)", color: "#15803d" }}>
                 <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2 6l3 3 5-5" stroke="#15803d" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" /></svg>
-                Approve
+                Approve issue
               </button>
               <button onClick={() => { moderation.onReject(report.id); onClose(); }} className="flex-1 py-2 rounded-xl text-xs font-semibold flex items-center justify-center gap-1.5"
                 style={{ background: "rgba(220,38,38,0.1)", color: "#dc2626" }}>
                 <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M3 3l6 6M9 3l-6 6" stroke="#dc2626" strokeWidth="1.5" strokeLinecap="round" /></svg>
-                Reject
+                Reject issue
               </button>
             </div>
           </>
@@ -2056,6 +2070,7 @@ function FeedView({ reports, onView, trustScores, onResolve, seenIds, showSeen =
               <span className="text-[11px] font-mono" style={{ color: muted }}>{item.location}</span>
             </div>
             <p className="text-sm font-semibold leading-snug" style={{ color: ink }}>{item.description}</p>
+            <ReportCount report={item} />
 
             {/* Official statement for critical reports */}
             {item.priority === "critical" && item.officialStatement && (
@@ -2186,6 +2201,7 @@ function MyReportsSheet({ reports, userName, onClose }: { reports: Report[]; use
                 </span>
               </div>
               <p className="text-sm font-semibold" style={{ color: ink }}>{r.description}</p>
+      <ReportCount report={r} showSuggestion />
               <p className="text-[10px] font-mono mt-1" style={{ color: dimmed }}>{r.time}</p>
             </div>
           ))}
@@ -2889,6 +2905,7 @@ function StaffReportsView({ reports, onApprove, onReject, onBan, onSetPriority, 
         </span>
       </div>
       <p className="text-sm font-semibold" style={{ color: ink }}>{r.description}</p>
+      <ReportCount report={r} showSuggestion />
 
       {/* Official statement indicator */}
       {r.officialStatement && (
@@ -2927,12 +2944,12 @@ function StaffReportsView({ reports, onApprove, onReject, onBan, onSetPriority, 
           <button onClick={() => onApprove(r.id)} className="flex-1 py-2 rounded-xl text-xs font-semibold flex items-center justify-center gap-1.5"
             style={{ background: "rgba(22,163,74,0.1)", color: "#15803d" }}>
             <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2 6l3 3 5-5" stroke="#15803d" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" /></svg>
-            Approve
+            Approve issue
           </button>
           <button onClick={() => onReject(r.id)} className="flex-1 py-2 rounded-xl text-xs font-semibold flex items-center justify-center gap-1.5"
             style={{ background: "rgba(220,38,38,0.1)", color: "#dc2626" }}>
             <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M3 3l6 6M9 3l-6 6" stroke="#dc2626" strokeWidth="1.5" strokeLinecap="round" /></svg>
-            Reject
+            Reject issue
           </button>
           <button onClick={() => onBan(r.id)} className="px-3 py-2 rounded-xl text-xs font-semibold" style={{ background: "rgba(0,0,0,0.06)", color: muted }} title="Ban user">🚫</button>
         </div>

@@ -4,6 +4,7 @@ import type { Doc, Id } from "./_generated/dataModel";
 import { mutation, query, type MutationCtx, type QueryCtx } from "./_generated/server";
 import { requireMembership, requireRole } from "./lib/authz";
 import { PRIORITY_ORDER, clampPercent, inferLocation } from "./lib/geo";
+import { reportGroup, sourcePriority } from "./lib/reportGroup";
 import { normalizedDescription } from "./lib/dedup";
 import { priorityValidator } from "./schema";
 
@@ -87,26 +88,43 @@ function shape(report: Doc<"reports">, who: { name: string; trustScore: number; 
   };
 }
 
-/** Collapse linked reports in the feed while retaining evidence in storage. */
-async function collapseDuplicates(ctx: QueryCtx, reports: Doc<"reports">[]) {
+/** One original card per incident, with counts derived from eligible accounts. */
+async function groupedCards(ctx: QueryCtx, reports: Doc<"reports">[], callerId: Id<"users">, moderator: boolean) {
   const seen = new Set<string>();
-  const result: Doc<"reports">[] = [];
+  const cards = [];
   for (const report of reports) {
-    const link = await ctx.db.query("incidentReports").withIndex("by_report", q => q.eq("reportId", report._id)).first();
-    // Keep separate moderation states and reporters: staff must still be able
-    // to assess independent evidence and rejected reports individually.
-    const key = link ? `${link.incidentId}:${report.reporterId}:${report.status}:${report.resolved}` : report._id;
+    const { original, incidentId } = await reportGroup(ctx, report);
+    const key = incidentId ?? original._id;
     if (seen.has(key)) continue;
     seen.add(key);
-    result.push(report);
+    const evidence: Doc<"reports">[] = [];
+    if (incidentId) {
+      const links = await ctx.db.query("incidentReports").withIndex("by_incident", q => q.eq("incidentId", incidentId)).take(1001);
+      for (const link of links.slice(0, 1000)) {
+        const item = await ctx.db.get("reports", link.reportId);
+        if (item?.eventId === original.eventId) evidence.push(item);
+      }
+    } else evidence.push(original);
+    const people = await reporterIndex(ctx, original.eventId, [original, ...evidence]);
+    const eligible = evidence.filter(r => r.status !== "rejected" && !people.get(r.reporterId)?.banned);
+    const reporterCount = original.status === "rejected" ? 0 : new Set(eligible.map(r => r.reporterId)).size;
+    const mine = evidence.some(r => r.reporterId === callerId);
+    const who = people.get(original.reporterId)!;
+    if (!moderator && !mine && (original.status !== "approved" || who.banned)) continue;
+    const incident = incidentId ? await ctx.db.get("incidents", incidentId) : null;
+    cards.push({ ...shape(original, who, callerId), isMine: mine,
+      resolved: original.resolved || Boolean(incident?.isResolved),
+      reporterCount, reportCount: evidence.length, countIsLowerBound: evidence.length >= 1000,
+      suggestedPriority: sourcePriority(reporterCount) });
   }
-  return result;
+  return cards;
 }
 
 async function loadForModeration(ctx: MutationCtx, reportId: Id<"reports">) {
-  const report = await ctx.db.get("reports", reportId);
-  if (report === null) throw new Error("That report no longer exists.");
-  const moderator = await requireRole(ctx, report.eventId, MODERATORS);
+  const submitted = await ctx.db.get("reports", reportId);
+  if (!submitted) throw new Error("That report no longer exists.");
+  const moderator = await requireRole(ctx, submitted.eventId, MODERATORS);
+  const { original: report } = await reportGroup(ctx, submitted);
   return { report, moderator };
 }
 
@@ -241,15 +259,7 @@ export const listForEvent = query({
       .order("desc")
       .take(MAX_REPORTS);
 
-    const index = await reporterIndex(ctx, args.eventId, reports);
-    const visible = [];
-    for (const report of await collapseDuplicates(ctx, reports)) {
-      const who = index.get(report.reporterId)!;
-      const mine = report.reporterId === membership.userId;
-      if (!isModerator && !mine && (report.status !== "approved" || who.banned)) continue;
-      visible.push(shape(report, who, membership.userId));
-    }
-    return visible;
+    return groupedCards(ctx, reports, membership.userId, isModerator);
   },
 });
 
@@ -265,11 +275,10 @@ export const listForStaff = query({
       .order("desc")
       .take(MAX_REPORTS);
 
-    const index = await reporterIndex(ctx, args.eventId, reports);
-    // Already newest-first; a stable sort by priority keeps that as the tiebreak.
-    return (await collapseDuplicates(ctx, reports))
-      .map((report) => shape(report, index.get(report.reporterId)!, membership.userId))
-      .sort((a, b) => (PRIORITY_ORDER[a.priority ?? "low"] ?? 3) - (PRIORITY_ORDER[b.priority ?? "low"] ?? 3));
+    return (await groupedCards(ctx, reports, membership.userId, true))
+      .sort((a, b) => (PRIORITY_ORDER[a.priority ?? a.suggestedPriority ?? "low"] ?? 3)
+        - (PRIORITY_ORDER[b.priority ?? b.suggestedPriority ?? "low"] ?? 3)
+        || b.reporterCount - a.reporterCount);
   },
 });
 
@@ -284,6 +293,10 @@ export const updateStatus = mutation({
 
     if (args.status === "resolved") {
       await ctx.db.patch("reports", report._id, { resolved: true });
+      const group = await reportGroup(ctx, report);
+      if (group.incidentId) await ctx.db.patch("incidents", group.incidentId, {
+        isResolved: true, resolvedAt: Date.now(), resolvedBy: moderator.userId,
+      });
       return null;
     }
 

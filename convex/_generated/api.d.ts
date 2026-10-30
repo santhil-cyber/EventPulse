@@ -37,6 +37,7 @@ import type * as lib_dedup from "../lib/dedup.js";
 import type * as lib_dispatchPolicy from "../lib/dispatchPolicy.js";
 import type * as lib_geo from "../lib/geo.js";
 import type * as lib_intakeRules from "../lib/intakeRules.js";
+import type * as lib_reportGroup from "../lib/reportGroup.js";
 import type * as lib_routeGraph from "../lib/routeGraph.js";
 import type * as lib_safety from "../lib/safety.js";
 import type * as lib_time from "../lib/time.js";
@@ -86,6 +87,7 @@ declare const fullApi: ApiFromModules<{
   "lib/dispatchPolicy": typeof lib_dispatchPolicy;
   "lib/geo": typeof lib_geo;
   "lib/intakeRules": typeof lib_intakeRules;
+  "lib/reportGroup": typeof lib_reportGroup;
   "lib/routeGraph": typeof lib_routeGraph;
   "lib/safety": typeof lib_safety;
   "lib/time": typeof lib_time;
