@@ -88,7 +88,7 @@ function ThemeToggle({ className = "" }: { className?: string }) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
 // ─────────────────────────────────────────────────────────────────────────────
-type Screen = "login" | "home" | "my-events" | "create-1" | "create-2" | "create-3" | "create-done" | "join-scan" | "staff-code" | "app" | "staff-app";
+type Screen = "login" | "home" | "my-events" | "create-1" | "create-2" | "create-done" | "join-scan" | "staff-code" | "app" | "staff-app";
 type Role = "organizer" | "attendee" | "staff";
 type Tab = "map" | "feed" | "info" | "you";
 type StaffTab = "map" | "command" | "poi" | "reports" | "feed" | "you";
@@ -104,7 +104,7 @@ interface EventData {
   startTime: string; endTime: string;
   // Plain text; at most 2,000 words (and 20,000 characters, server-side).
   description: string;
-  floorPlanUploaded: boolean; staff: string[];
+  floorPlanUploaded: boolean;
   attendeeCode: string; staffCode: string;
   // Set while the create wizard is in flight, before the event row exists.
   eventId?: Id<"events">;
@@ -1599,7 +1599,7 @@ function CreateStep1({ eventData, onChange, onNext, onBack }: { eventData: Parti
     <div className="flex-1 flex flex-col px-5 pt-4 pb-8 overflow-y-auto" style={{ background: cream }}>
       <BackBtn onBack={onBack} />
       <div className="mt-4 mb-6">
-        <p className="text-[10px] font-mono uppercase tracking-widest" style={{ color: muted }}>Step 1 of 3</p>
+        <p className="text-[10px] font-mono uppercase tracking-widest" style={{ color: muted }}>Step 1 of 2</p>
         <h2 className="text-xl font-bold mt-1" style={{ color: ink, letterSpacing: "-0.02em" }}>Event Details</h2>
       </div>
       <div className="flex flex-col gap-4 flex-1">
@@ -1658,7 +1658,7 @@ function CreateStep1({ eventData, onChange, onNext, onBack }: { eventData: Parti
   );
 }
 
-function CreateStep2({ eventData, onChange, onNext, onBack }: { eventData: Partial<EventData>; onChange: (d: Partial<EventData>) => void; onNext: () => void; onBack: () => void }) {
+function CreateStep2({ eventData, onChange, onNext, onBack, creating = false, createError = null }: { eventData: Partial<EventData>; onChange: (d: Partial<EventData>) => void; onNext: () => void; onBack: () => void; creating?: boolean; createError?: string | null }) {
   const uploaded = eventData.floorPlanUploaded;
   const generateUploadUrl = useMutation(api.files.generateUploadUrl);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -1695,7 +1695,7 @@ function CreateStep2({ eventData, onChange, onNext, onBack }: { eventData: Parti
     <div className="flex-1 min-h-0 flex flex-col px-5 pt-4 pb-8" style={{ background: cream }}>
       <BackBtn onBack={onBack} />
       <div className="mt-4 mb-6 shrink-0">
-        <p className="text-[10px] font-mono uppercase tracking-widest" style={{ color: muted }}>Step 2 of 3</p>
+        <p className="text-[10px] font-mono uppercase tracking-widest" style={{ color: muted }}>Step 2 of 2</p>
         <h2 className="text-xl font-bold mt-1" style={{ color: ink, letterSpacing: "-0.02em" }}>Upload Floor Plan</h2>
         <p className="text-sm mt-1" style={{ color: muted }}>This will be shown as the venue map to all participants.</p>
       </div>
@@ -1732,45 +1732,10 @@ function CreateStep2({ eventData, onChange, onNext, onBack }: { eventData: Parti
         </div>
       )}
       {/* shrink-0: the action button is pinned and always visible. */}
-      <button onClick={onNext} disabled={!uploaded} className="w-full py-4 rounded-2xl font-semibold text-sm text-white mt-4 shrink-0"
-        style={{ background: accent, opacity: uploaded ? 1 : 0.4, cursor: uploaded ? "pointer" : "not-allowed" }}>Next: Assign Staff</button>
-    </div>
-  );
-}
-
-function CreateStep3({ eventData, onChange, onNext, onBack, busy = false, error = null }: { eventData: Partial<EventData>; onChange: (d: Partial<EventData>) => void; onNext: () => void; onBack: () => void; busy?: boolean; error?: string | null }) {
-  const [input, setInput] = useState("");
-  const staff = eventData.staff ?? [];
-  const add = () => { const v = input.trim(); if (v && !staff.includes(v)) { onChange({ ...eventData, staff: [...staff, v] }); setInput(""); } };
-  return (
-    <div className="flex-1 flex flex-col px-5 pt-4 pb-8 overflow-y-auto" style={{ background: cream }}>
-      <BackBtn onBack={onBack} />
-      <div className="mt-4 mb-6">
-        <p className="text-[10px] font-mono uppercase tracking-widest" style={{ color: muted }}>Step 3 of 3</p>
-        <h2 className="text-xl font-bold mt-1" style={{ color: ink, letterSpacing: "-0.02em" }}>Assign Staff</h2>
-        <p className="text-sm mt-1" style={{ color: error ? "#dc2626" : muted }}>{error ?? (busy ? "Creating your event…" : "Add staff emails. They'll receive a private code to join.")}</p>
-      </div>
-      <div className="flex gap-2 mb-4">
-        <input type="email" value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={(e) => e.key === "Enter" && add()}
-          placeholder="staff@example.com" className="flex-1 rounded-xl px-4 py-3 text-sm outline-none"
-          style={{ background: card, border: `1px solid ${border}`, color: ink, fontFamily: "'Outfit', sans-serif" }} />
-        <button onClick={add} className="px-4 py-3 rounded-xl font-semibold text-sm text-white shrink-0" style={{ background: accent }}>Add</button>
-      </div>
-      <div className="flex flex-col gap-2 flex-1">
-        {staff.length === 0 ? (
-          <div className="flex-1 flex items-center justify-center"><p className="text-sm" style={{ color: dimmed }}>No staff added yet</p></div>
-        ) : staff.map((s) => (
-          <div key={s} className="flex items-center justify-between px-4 py-3 rounded-xl" style={{ background: card, border: `1px solid ${border}` }}>
-            <div className="flex items-center gap-2.5">
-              <div className="w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold" style={{ background: "#e8e3f0", color: accent }}>{s[0].toUpperCase()}</div>
-              <span className="text-sm font-medium" style={{ color: ink }}>{s}</span>
-            </div>
-            <button onClick={() => onChange({ ...eventData, staff: staff.filter((x) => x !== s) })} className="text-xs" style={{ color: dimmed }}>✕</button>
-          </div>
-        ))}
-      </div>
-      <button onClick={onNext} disabled={busy} className="w-full py-4 rounded-2xl font-semibold text-sm text-white mt-4" style={{ background: accent, opacity: busy ? 0.4 : 1, cursor: busy ? "not-allowed" : "pointer" }}>
-        {staff.length === 0 ? "Skip & Generate Codes" : "Generate Codes"}
+      {createError && <p role="alert" className="text-xs mt-3 shrink-0" style={{ color: "#dc2626" }}>{createError}</p>}
+      <button onClick={onNext} disabled={!uploaded || busy || creating} className="w-full py-4 rounded-2xl font-semibold text-sm text-white mt-4 shrink-0"
+        style={{ background: accent, opacity: uploaded && !busy && !creating ? 1 : 0.4, cursor: uploaded && !busy && !creating ? "pointer" : "not-allowed" }}>
+        {creating ? "Creating your event…" : "Generate QR & Codes"}
       </button>
     </div>
   );
@@ -3450,7 +3415,7 @@ export default function App() {
   const [showReport, setShowReport] = useState(false);
   const [showLeave, setShowLeave] = useState(false);
   const [pins, setPins] = useState<Pin[]>([]);
-  const [eventData, setEventData] = useState<Partial<EventData>>({ attendeeCode: MOCK_ATTENDEE_CODE, staffCode: MOCK_STAFF_CODE, staff: [] });
+  const [eventData, setEventData] = useState<Partial<EventData>>({ attendeeCode: MOCK_ATTENDEE_CODE, staffCode: MOCK_STAFF_CODE });
   const [seenIds, setSeenIds] = useState<Set<string>>(new Set());
   const [poiPin, setPoiPin] = useState<Pin | null>(null);
   const [poiPinning, setPoiPinning] = useState(false);
@@ -3516,7 +3481,7 @@ export default function App() {
     setShowReport(false);
     setShowLeave(false);
     setPins([]);
-    setEventData({ attendeeCode: MOCK_ATTENDEE_CODE, staffCode: MOCK_STAFF_CODE, staff: [] });
+    setEventData({ attendeeCode: MOCK_ATTENDEE_CODE, staffCode: MOCK_STAFF_CODE });
     setSeenIds(new Set());
     setPoiPin(null);
     setPoiPinning(false);
@@ -3712,7 +3677,7 @@ export default function App() {
     setScreen("home"); setPins([]); setTab("map"); setStaffTab("map"); setShowLeave(false); setShowReport(false); setPinpointMode(false); setStaffPinpointMode(false);
     expectedExitRef.current = false;
     setPendingRole("attendee");
-    setEventData({ attendeeCode: MOCK_ATTENDEE_CODE, staffCode: MOCK_STAFF_CODE, staff: [] });
+    setEventData({ attendeeCode: MOCK_ATTENDEE_CODE, staffCode: MOCK_STAFF_CODE });
   };
 
   const reportRetryRef = useRef<{ payload: string; clientId: string } | null>(null);
@@ -3802,8 +3767,7 @@ export default function App() {
           onOpen={(id) => { setMyEventsError(null); void openEvent(id, "staff-app", setMyEventsError); }} />;
 
       case "create-1": return <CreateStep1 eventData={eventData} onChange={setEventData} onNext={() => setScreen("create-2")} onBack={() => setScreen("my-events")} />;
-      case "create-2": return <CreateStep2 eventData={eventData} onChange={setEventData} onNext={() => setScreen("create-3")} onBack={() => setScreen("create-1")} />;
-      case "create-3": return <CreateStep3 eventData={eventData} onChange={setEventData} onNext={() => { void handleCreateEvent(); }} onBack={() => { setCreateError(null); setScreen("create-2"); }} busy={createBusy} error={createError} />;
+      case "create-2": return <CreateStep2 eventData={eventData} onChange={setEventData} onNext={() => { void handleCreateEvent(); }} onBack={() => { if (!createBusy) { setCreateError(null); setScreen("create-1"); } }} creating={createBusy} createError={createError} />;
 
       case "create-done":
         return <CreateDoneScreen eventData={eventData as EventData} onEnterEvent={() => { setPendingRole("organizer"); setScreen("staff-app"); }} onHome={() => setScreen("home")} />;
