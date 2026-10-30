@@ -70,3 +70,16 @@ test("provider configuration rejects credential-bearing or insecure URLs before 
   }
   expect(fetch).not.toHaveBeenCalled();
 });
+
+test("NLP duplicate comparison validates structured meaning match output", async () => {
+  const { compareIncidentReports } = await import("./provider");
+  const requests: Record<string, unknown>[] = [];
+  vi.stubGlobal("fetch", vi.fn(async (_input: unknown, init?: RequestInit) => {
+    requests.push(JSON.parse(String(init?.body)));
+    return response({candidateId:"incident-one",confidence:0.98});
+  }));
+  const result = await compareIncidentReports("Entrance se dhuan aa raha hai", [{id:"incident-one",description:"Smoke is rising near the entrance"}]);
+  expect(result).toEqual({candidateId:"incident-one",confidence:0.98});
+  expect(requests[0]).toHaveProperty("text.format.strict",true);
+  expect(requests[0].store).toBe(false);
+});

@@ -23,6 +23,8 @@ import type * as ai_knowledgeActions from "../ai/knowledgeActions.js";
 import type * as ai_policy from "../ai/policy.js";
 import type * as ai_provider from "../ai/provider.js";
 import type * as ai_resources from "../ai/resources.js";
+import type * as ai_semanticIntake from "../ai/semanticIntake.js";
+import type * as ai_semanticMatch from "../ai/semanticMatch.js";
 import type * as ai_state from "../ai/state.js";
 import type * as ai_validators from "../ai/validators.js";
 import type * as auth from "../auth.js";
@@ -70,6 +72,8 @@ declare const fullApi: ApiFromModules<{
   "ai/policy": typeof ai_policy;
   "ai/provider": typeof ai_provider;
   "ai/resources": typeof ai_resources;
+  "ai/semanticIntake": typeof ai_semanticIntake;
+  "ai/semanticMatch": typeof ai_semanticMatch;
   "ai/state": typeof ai_state;
   "ai/validators": typeof ai_validators;
   auth: typeof auth;

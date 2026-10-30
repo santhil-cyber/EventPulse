@@ -162,7 +162,8 @@ export default defineSchema({
     createdAt: v.number(),
   })
     .index("by_event_created", ["eventId", "createdAt"])
-    .index("by_clientId", ["clientId"]),
+    .index("by_clientId", ["clientId"])
+    .index("by_event_reporter_createdAt", ["eventId", "reporterId", "createdAt"]),
 
   mapPins: defineTable({
     eventId: v.id("events"),

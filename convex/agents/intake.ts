@@ -1,9 +1,9 @@
 import { v } from "convex/values";
 import type { Doc, Id } from "../_generated/dataModel";
-import { internalAction, internalMutation, internalQuery, type MutationCtx } from "../_generated/server";
+import { env, internalAction, internalMutation, internalQuery, type MutationCtx } from "../_generated/server";
 import { logAgentAction } from "../lib/agentLog";
 import { classifyIncident } from "../lib/intakeRules";
-import { duplicateScore } from "../lib/dedup";
+import { duplicateScore, DEDUP_WINDOW_MS, DEDUP_RADIUS } from "../lib/dedup";
 import { incidentTypeValidator, severityValidator } from "../schema";
 
 /** Idempotent transactional boundary shared by live and demo intake. */
@@ -19,9 +19,19 @@ export async function executeCreateOrUpdateIncident(ctx: MutationCtx, args: {
   const link = await ctx.db.query("incidentReports").withIndex("by_report", q => q.eq("reportId", args.reportId)).first();
   if (link) return { incidentId: link.incidentId, isNew: false };
   const now = Date.now();
+  // Recheck inside the write transaction: concurrent intake actions cannot both
+  // create a new incident from a stale candidate snapshot.
+  const recent = await ctx.db.query("incidents").withIndex("by_event_created", q =>
+    q.eq("eventId", args.eventId).gte("createdAt", now - DEDUP_WINDOW_MS)).order("desc").take(100);
+  const best = recent.filter(x => !x.isResolved)
+    .map(x => ({ id: x._id, score: duplicateScore({ ...report, incidentType: args.incidentType }, x) }))
+    .sort((a, b) => b.score - a.score)[0];
+  if (best && best.score > 0) args = { ...args, matchedIncidentId: best.id, similarityScore: best.score };
   if (args.matchedIncidentId) {
     const incident = await ctx.db.get("incidents", args.matchedIncidentId);
-    if (incident && incident.eventId === args.eventId && !incident.isResolved && incident.incidentType === args.incidentType) {
+    if (incident && incident.eventId === args.eventId && !incident.isResolved && now - incident.createdAt <= DEDUP_WINDOW_MS
+      && Math.hypot(report.pinX - incident.pinX, report.pinY - incident.pinY) <= DEDUP_RADIUS
+      && (incident.incidentType === args.incidentType || duplicateScore({ ...report, incidentType: args.incidentType }, incident) === 1 || incident.incidentType === "other" || args.incidentType === "other")) {
       await ctx.db.insert("incidentReports", { incidentId: incident._id, reportId: args.reportId, isOriginal: false, similarityScore: args.similarityScore ?? 0, addedAt: now });
       const rank = { critical: 4, high: 3, medium: 2, low: 1 };
       const patch: Partial<Doc<"incidents">> = {
@@ -82,16 +92,25 @@ export const create_or_update_incident = internalMutation({
 });
 
 export const processReport = internalMutation({
-  args: { reportId: v.id("reports") },
-  handler: async (ctx, { reportId }) => {
+  args: { reportId: v.id("reports"), matchedIncidentId: v.optional(v.id("incidents")), similarityScore: v.optional(v.number()) },
+  returns: v.object({ incidentId: v.id("incidents"), isNew: v.boolean(), incidentType: incidentTypeValidator, severity: severityValidator }),
+  handler: async (ctx, { reportId, matchedIncidentId, similarityScore }) => {
     const report = await ctx.db.get("reports", reportId);
     if (!report) throw new Error("Report not found");
     const { incidentType, severity } = classifyIncident(report.description, report.priority);
+    if (matchedIncidentId) {
+      const settings = await ctx.db.query("aiSettings").withIndex("by_eventId", q => q.eq("eventId", report.eventId)).unique();
+      if (settings?.mode !== "assist" || env.EVENTPULSE_AI_ENABLED !== "true" || !env.OPENAI_API_KEY || !env.OPENAI_TEXT_MODEL
+        || !Number.isFinite(similarityScore) || (similarityScore ?? 0) < 0.95) {
+        matchedIncidentId = undefined;
+        similarityScore = undefined;
+      }
+    }
     const recent = await ctx.db.query("incidents").withIndex("by_event_created", q => q.eq("eventId", report.eventId).gte("createdAt", Date.now() - 2_700_000)).order("desc").take(100);
     const matches = recent.filter(x => !x.isResolved).map(x => ({ id: x._id, score: duplicateScore({ ...report, incidentType }, x) })).filter(x => x.score > 0).sort((a,b) => b.score - a.score);
     const result = await executeCreateOrUpdateIncident(ctx, {
-      ...report, reportId, incidentType, severity, matchedIncidentId: matches[0]?.id,
-      similarityScore: matches[0]?.score, hasImageEvidence: Boolean(report.imageStorageId || report.imageUrl),
+      ...report, reportId, incidentType, severity, matchedIncidentId: matches[0]?.id ?? matchedIncidentId,
+      similarityScore: matches[0]?.score ?? similarityScore, hasImageEvidence: Boolean(report.imageStorageId || report.imageUrl),
     });
     return { ...result, incidentType, severity };
   },

@@ -6,18 +6,19 @@ import { logAgentAction } from "./lib/agentLog";
 
 /** Immediate rule-based triage never waits for an AI provider. */
 export const processNewReport = internalMutation({
-  args: { reportId: v.id("reports") },
-  handler: async (ctx, { reportId }) => {
+  args: { reportId: v.id("reports"), matchedIncidentId: v.optional(v.id("incidents")), similarityScore: v.optional(v.number()) },
+  returns: v.null(),
+  handler: async (ctx, { reportId, matchedIncidentId, similarityScore }) => {
     const report = await ctx.db.get("reports", reportId);
-    if (!report) return;
+    if (!report) return null;
     const existing = await ctx.db.query("pipelineRuns").withIndex("by_reportId", q => q.eq("reportId", reportId)).first();
-    if (existing) return;
+    if (existing) return null;
     const now = Date.now();
     const runId = await ctx.db.insert("pipelineRuns", { eventId: report.eventId, reportId, runCode: `LIVE-${reportId.slice(-8)}`,
       activeAgent: "intake", agentPhase: "starting", currentThought: "Rule-based triage; optional AI runs independently.",
       agentTimestamps: JSON.stringify({ intake: { startedAt: now } }), status: "running", startedAt: now, isDemo: false });
     try {
-      const result = await ctx.runMutation(internal.agents.intake.processReport, { reportId });
+      const result = await ctx.runMutation(internal.agents.intake.processReport, { reportId, matchedIncidentId, similarityScore });
       await ctx.db.patch("pipelineRuns", runId, { incidentId: result.incidentId });
       await ctx.scheduler.runAfter(0, internal.orchestrator.runVerification, { incidentId: result.incidentId, runId });
       // A component/AI failure cannot roll back the incident or interrupt staff triage.
@@ -26,6 +27,7 @@ export const processNewReport = internalMutation({
     } catch {
       await ctx.db.patch("pipelineRuns", runId, { status: "failed", currentThought: "Intake failed. Original report remains available to staff.", completedAt: Date.now() });
     }
+    return null;
   },
 });
 async function progress(ctx: MutationCtx, runId: Id<"pipelineRuns"> | undefined, activeAgent: "verification" | "crowd_intel" | "routing" | "dispatch" | "completed", text: string) {

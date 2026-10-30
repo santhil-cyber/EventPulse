@@ -23,7 +23,7 @@ flowchart TD
   Retrieve --> Quotes[Exact source excerpts or abstention]
 ```
 
-AI never verifies incidents, automatically merges semantic duplicates, approves routes, assigns arbitrary tools, or contacts emergency services. The agent stages are deterministic Convex functions with explicit dependencies, not autonomous model loops. LangChain is used for model and embedding adapters; LangGraph and durable chat history are not required for the implemented stateless question flow.
+AI never verifies incidents or approves routes, assigns arbitrary tools, or contacts emergency services. The agent stages are deterministic Convex functions with explicit dependencies, not autonomous model loops. LangChain is used for model and embedding adapters; LangGraph and durable chat history are not required for the implemented stateless question flow.
 
 Rule-based incident creation runs independently of provider availability. Provider failures leave reports and staff triage available. AI output is schema validated, tied to a report hash and attempt, and rejected when its event, incident, report, model or configuration becomes invalid. Optional AI errors do not roll back report intake.
 
@@ -141,3 +141,36 @@ These are single-request contract checks, not latency benchmarks, broad quality 
 Vision is configured locally to use `google/gemini-2.5-flash` through the same OpenRouter Chat Completions adapter as text. To exercise it, the local deployment must be running, then an organizer must select Shadow or Assist, enable “Analyze stored photos,” and submit a normal report with a registered JPEG/PNG/WebP upload. Simulated reports skip provider analysis, and their public showcase image URLs are display-only; the Agent 1 showcase is deterministic text triage and deduplication, not a live vision call. Embeddings remain unconfigured, so RAG indexing and semantic duplicate suggestions are unavailable. Successful citation selection does not mean vector indexing/retrieval has been validated.
 
 The provider switch changed environment configuration only. The latest automated suite has 28 passing tests; frontend build, backend typecheck and lint previously passed. The local frontend is http://localhost:5173 and backend http://127.0.0.1:3210. The local Convex backend has successfully prepared functions under Node 22. Authenticated browser regression, broader model evaluations and production release checks remain necessary.
+
+## Repeat submissions and NLP deduplication
+
+A repeat submission by the same attendee within 60 seconds returns the existing
+report ID when normalized text and evidence are identical and the pin moves no
+more than 2 map percentage points. This works before the first intake runs and
+with AI off. A resolved or rejected report does not suppress a new submission.
+
+Intake also matches exact normalized text for `other` categories. Incident
+matching requires the same event, an unresolved incident created in the last
+45 minutes, and pins within 10 map percentage points. Coordinates are floor-map
+percentages, not GPS coordinates or meters. Different known hazard categories
+remain separate. Matching and incident creation are rechecked in one transaction.
+
+In Assist mode only, nearby reports that fail lexical matching are compared by
+the configured text model, across paraphrases and languages. Only an allowed
+candidate ID with confidence >= 0.95 can be linked; event settings, active state,
+category, time and coordinates are checked again when committing. Comparison
+uses existing per-event provider budgets. Provider failure, timeout, Off and
+Shadow mode fall back to deterministic intake. A durable 30-second fallback
+ensures an interrupted provider action cannot strand an accepted report.
+
+For Gemini NLP, use a Gemini API credential as `OPENAI_API_KEY`,
+`OPENAI_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai`,
+`OPENAI_API_MODE=chat`, and a Gemini model supporting structured output as
+`OPENAI_TEXT_MODEL`. Configure these only on the backend and enable Assist for
+the event. Gemini connectivity must be verified with the selected model before
+rollout. No additional credential or model is silently provisioned.
+
+Linked repeat reports by the same reporter and moderation state collapse to one
+feed card. Original report documents and incident links remain available to the
+verification agent. Distinct reporters remain separate evidence; a repeated
+submission by one account never increases the independent-source count.

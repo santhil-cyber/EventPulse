@@ -4,6 +4,7 @@ import type { Doc, Id } from "./_generated/dataModel";
 import { mutation, query, type MutationCtx, type QueryCtx } from "./_generated/server";
 import { requireMembership, requireRole } from "./lib/authz";
 import { PRIORITY_ORDER, clampPercent, inferLocation } from "./lib/geo";
+import { normalizedDescription } from "./lib/dedup";
 import { priorityValidator } from "./schema";
 
 const MODERATORS = ["ORGANIZER", "STAFF"] as const;
@@ -86,6 +87,22 @@ function shape(report: Doc<"reports">, who: { name: string; trustScore: number; 
   };
 }
 
+/** Collapse linked reports in the feed while retaining evidence in storage. */
+async function collapseDuplicates(ctx: QueryCtx, reports: Doc<"reports">[]) {
+  const seen = new Set<string>();
+  const result: Doc<"reports">[] = [];
+  for (const report of reports) {
+    const link = await ctx.db.query("incidentReports").withIndex("by_report", q => q.eq("reportId", report._id)).first();
+    // Keep separate moderation states and reporters: staff must still be able
+    // to assess independent evidence and rejected reports individually.
+    const key = link ? `${link.incidentId}:${report.reporterId}:${report.status}:${report.resolved}` : report._id;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(report);
+  }
+  return result;
+}
+
 async function loadForModeration(ctx: MutationCtx, reportId: Id<"reports">) {
   const report = await ctx.db.get("reports", reportId);
   if (report === null) throw new Error("That report no longer exists.");
@@ -163,6 +180,22 @@ export const create = mutation({
       imageUrl = args.imageUrl.slice(0, 2048);
     }
 
+    // A new client UUID is minted when the form is submitted again. Check the
+    // content transactionally too, including while the first intake is queued.
+    const recentRepeats = await ctx.db.query("reports")
+      .withIndex("by_event_reporter_createdAt", q => q.eq("eventId", args.eventId)
+        .eq("reporterId", membership.userId).gte("createdAt", Date.now() - 60_000))
+      .order("desc").take(6);
+    const repeat = recentRepeats.find(r => !r.resolved && r.status !== "rejected"
+      && normalizedDescription(r.description) === normalizedDescription(description)
+      && Math.hypot(r.pinX - pinX, r.pinY - pinY) <= 2
+      && r.imageStorageId === args.imageStorageId && (args.imageStorageId !== undefined || r.imageUrl === imageUrl));
+    if (repeat) {
+      const link = await ctx.db.query("incidentReports").withIndex("by_report", q => q.eq("reportId", repeat._id)).first();
+      const incident = link ? await ctx.db.get("incidents", link.incidentId) : null;
+      if (!incident?.isResolved) return repeat._id;
+    }
+
     // Trusted reporters and event staff skip the moderation queue.
     const autoApprove =
       membership.role === "STAFF" || membership.role === "ORGANIZER" || membership.trustScore > 90;
@@ -183,7 +216,7 @@ export const create = mutation({
       createdAt: Date.now(),
     });
 
-    await ctx.scheduler.runAfter(0, internal.orchestrator.processNewReport, { reportId });
+    await ctx.scheduler.runAfter(0, internal.ai.semanticIntake.processNewReport, { reportId });
 
     return reportId;
   },
@@ -210,7 +243,7 @@ export const listForEvent = query({
 
     const index = await reporterIndex(ctx, args.eventId, reports);
     const visible = [];
-    for (const report of reports) {
+    for (const report of await collapseDuplicates(ctx, reports)) {
       const who = index.get(report.reporterId)!;
       const mine = report.reporterId === membership.userId;
       if (!isModerator && !mine && (report.status !== "approved" || who.banned)) continue;
@@ -234,7 +267,7 @@ export const listForStaff = query({
 
     const index = await reporterIndex(ctx, args.eventId, reports);
     // Already newest-first; a stable sort by priority keeps that as the tiebreak.
-    return reports
+    return (await collapseDuplicates(ctx, reports))
       .map((report) => shape(report, index.get(report.reporterId)!, membership.userId))
       .sort((a, b) => (PRIORITY_ORDER[a.priority ?? "low"] ?? 3) - (PRIORITY_ORDER[b.priority ?? "low"] ?? 3));
   },

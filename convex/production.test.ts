@@ -540,3 +540,70 @@ test("only on-duty staff phones ring for incidents", async () => {
   expect(await staffClient.query(api.responders.myAlertStatus,{eventId:f.eventId})).toEqual({ ring:true,reason:"on_duty" });
   await expect(f.outsiderClient.query(api.responders.myAlertStatus,{eventId:f.eventId})).rejects.toThrow();
 });
+
+test("same attendee submits again ten seconds later with a fresh UUID: one report even before intake", async () => {
+  const f = await fixture();
+  const args = { eventId: f.eventId, clientId: "repeat-a", description: "The music is far too loud", pinX: 40, pinY: 40 };
+  const first = await f.attendeeClient.mutation(api.reports.create, args);
+  vi.setSystemTime(Date.now() + 10_000);
+  const second = await f.attendeeClient.mutation(api.reports.create, { ...args, clientId: "repeat-b", description: " THE music is far too loud!! ", pinX: 40.5 });
+  expect(second).toBe(first);
+  const a = await f.t.mutation(internal.agents.intake.processReport, { reportId: first });
+  const b = await f.t.mutation(internal.agents.intake.processReport, { reportId: second });
+  expect(b.incidentId).toBe(a.incidentId);
+  const sources = await f.t.query(internal.agents.verification.check_source_independence, { incidentId: a.incidentId });
+  expect(sources.independentCount).toBe(1);
+  expect(sources.reportCount).toBe(1);
+});
+
+test("unclassified repeat reports share an incident and one feed card while retaining original evidence", async () => {
+  const f = await fixture();
+  await f.t.run(ctx => ctx.db.patch("reports", f.reportId, { description: "Music is too loud" }));
+  const a = await intake(f);
+  vi.setSystemTime(Date.now() + 10_000);
+  const second = await f.t.run(ctx => ctx.db.insert("reports", { eventId:f.eventId,reporterId:f.attendee,description:"Music is too loud!",location:"Pinned on map",pinX:20.5,pinY:20,status:"pending",views:0,resolved:false,clientId:"legacy-repeat",createdAt:Date.now() }));
+  const b = await f.t.mutation(internal.agents.intake.processReport, { reportId: second });
+  expect(b.incidentId).toBe(a.incidentId);
+  expect((await f.staff.query(api.reports.listForStaff, {eventId:f.eventId}))).toHaveLength(1);
+  const sources = await f.t.query(internal.agents.verification.check_source_independence, { incidentId: a.incidentId });
+  expect(sources.reportCount).toBe(2);
+  expect(sources.independentCount).toBe(1);
+});
+
+test("identical descriptions at distant pins and resolved incidents remain separate", async () => {
+  const f = await fixture();
+  const args = { eventId:f.eventId,clientId:"pin-a",description:"The music is far too loud",pinX:40,pinY:40 };
+  const first = await f.attendeeClient.mutation(api.reports.create,args);
+  const a = await f.t.mutation(internal.agents.intake.processReport,{reportId:first});
+  const far = await f.attendeeClient.mutation(api.reports.create,{...args,clientId:"pin-b",pinX:80});
+  const b = await f.t.mutation(internal.agents.intake.processReport,{reportId:far});
+  expect(b.incidentId).not.toBe(a.incidentId);
+  await f.t.run(async ctx => { await ctx.db.patch("incidents",a.incidentId,{isResolved:true}); await ctx.db.patch("reports",first,{resolved:true}); });
+  const fresh = await f.attendeeClient.mutation(api.reports.create,{...args,clientId:"pin-c"});
+  expect(fresh).not.toBe(first);
+  expect((await f.t.mutation(internal.agents.intake.processReport,{reportId:fresh})).incidentId).not.toBe(a.incidentId);
+});
+
+test("semantic match is revalidated against event settings, coordinates and active incident state", async () => {
+  const f = await fixture(); const a = await intake(f);
+  const second = await f.t.run(ctx => ctx.db.insert("reports", {eventId:f.eventId,reporterId:f.attendee,description:"Flames visible beside the doorway",location:"Pinned on map",pinX:20,pinY:20,status:"pending",views:0,resolved:false,clientId:"paraphrase",createdAt:Date.now()}));
+  vi.stubEnv("EVENTPULSE_AI_ENABLED","true"); vi.stubEnv("OPENAI_API_KEY","test-key");vi.stubEnv("OPENAI_TEXT_MODEL","test-model");
+  await f.t.run(ctx => ctx.db.insert("aiSettings",{eventId:f.eventId,mode:"assist",visionEnabled:false,ragEnabled:false,updatedBy:f.organizer,updatedAt:Date.now()}));
+  const b = await f.t.mutation(internal.agents.intake.processReport,{reportId:second,matchedIncidentId:a.incidentId,similarityScore:0.98});
+  expect(b.incidentId).toBe(a.incidentId);
+  const sources = await f.t.query(internal.agents.verification.check_source_independence,{incidentId:a.incidentId});
+  expect(sources.independentCount).toBe(1);
+});
+
+test.each(["off", "distant", "resolved", "other-event", "low-confidence"])("semantic candidate cannot bypass %s boundary", async boundary => {
+  const f = await fixture(); const a = await intake(f);
+  vi.stubEnv("EVENTPULSE_AI_ENABLED", "true");vi.stubEnv("OPENAI_API_KEY","test-key");vi.stubEnv("OPENAI_TEXT_MODEL","test-model");
+  await f.t.run(async ctx => {
+    await ctx.db.insert("aiSettings",{eventId:f.eventId,mode:boundary === "off" ? "off" : "assist",visionEnabled:false,ragEnabled:false,updatedBy:f.organizer,updatedAt:Date.now()});
+    if (boundary === "resolved") await ctx.db.patch("incidents",a.incidentId,{isResolved:true});
+    if (boundary === "other-event") await ctx.db.patch("incidents",a.incidentId,{eventId:f.otherEvent});
+  });
+  const reportId = await f.t.run(ctx => ctx.db.insert("reports",{eventId:f.eventId,reporterId:f.attendee,description:"Flames visible beside the doorway",location:"Pinned on map",pinX:boundary === "distant" ? 80 : 20,pinY:20,status:"pending",views:0,resolved:false,clientId:`semantic-${boundary}`,createdAt:Date.now()}));
+  const b = await f.t.mutation(internal.agents.intake.processReport,{reportId,matchedIncidentId:a.incidentId,similarityScore:boundary === "low-confidence" ? 0.8 : 0.98});
+  expect(b.incidentId).not.toBe(a.incidentId);
+});

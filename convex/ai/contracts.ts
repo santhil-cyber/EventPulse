@@ -11,3 +11,7 @@ export const AnswerSchema = z.object({
   abstain: z.boolean(),
   citations: z.array(z.object({ chunkId: z.string(), quote: z.string().min(8).max(1000) })).max(5),
 });
+
+export const DuplicateMatchSchema = z.object({
+  candidateId: z.string().nullable(), confidence: z.number().min(0).max(1),
+});
