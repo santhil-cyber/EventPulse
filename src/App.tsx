@@ -15,6 +15,77 @@ import landingIllustration from "@/assets/landing-illustration.png";
 import { AgentCommandCenter } from "./AgentCommandCenter";
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Theme (light / dark)
+// ─────────────────────────────────────────────────────────────────────────────
+// Light ("cream") is the default. The choice is persisted to localStorage and
+// applied by setting data-theme on <html>, which flips the CSS variables in
+// index.css that every palette token reads. A tiny subscriber store lets the
+// toggle button re-render without threading context through the whole tree.
+type Theme = "light" | "dark";
+const THEME_KEY = "eventpulse-theme";
+
+function readTheme(): Theme {
+  if (typeof window === "undefined") return "light";
+  const saved = window.localStorage.getItem(THEME_KEY);
+  return saved === "dark" ? "dark" : "light";
+}
+
+function applyTheme(theme: Theme) {
+  const root = document.documentElement;
+  if (theme === "dark") root.setAttribute("data-theme", "dark");
+  else root.removeAttribute("data-theme");
+}
+
+const themeListeners = new Set<() => void>();
+let currentTheme: Theme = readTheme();
+// Paint the initial theme as early as the module loads, before first render.
+if (typeof document !== "undefined") applyTheme(currentTheme);
+
+function setTheme(theme: Theme) {
+  currentTheme = theme;
+  try { window.localStorage.setItem(THEME_KEY, theme); } catch { /* storage blocked — session-only */ }
+  applyTheme(theme);
+  themeListeners.forEach((fn) => fn());
+}
+
+function useTheme(): [Theme, () => void] {
+  const [, force] = useState(0);
+  useEffect(() => {
+    const fn = () => force((n) => n + 1);
+    themeListeners.add(fn);
+    return () => { themeListeners.delete(fn); };
+  }, []);
+  const toggle = useCallback(() => setTheme(currentTheme === "dark" ? "light" : "dark"), []);
+  return [currentTheme, toggle];
+}
+
+/** Sun / moon pill. Sits in the app chrome; purely presentational. */
+function ThemeToggle({ className = "" }: { className?: string }) {
+  const [theme, toggle] = useTheme();
+  const dark = theme === "dark";
+  return (
+    <button
+      onClick={toggle}
+      aria-label={dark ? "Switch to light mode" : "Switch to dark mode"}
+      title={dark ? "Light mode" : "Dark mode"}
+      className={`w-9 h-9 rounded-xl flex items-center justify-center transition-colors duration-200 ${className}`}
+      style={{ background: "var(--surface)", border: "1px solid var(--border)", color: "var(--muted)" }}
+    >
+      {dark ? (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <circle cx="12" cy="12" r="4" />
+          <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41" />
+        </svg>
+      ) : (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+        </svg>
+      )}
+    </button>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Types
 // ─────────────────────────────────────────────────────────────────────────────
 type Screen = "login" | "home" | "my-events" | "create-1" | "create-2" | "create-3" | "create-done" | "join-scan" | "staff-code" | "app" | "staff-app";
@@ -237,9 +308,16 @@ const PRIORITY_CARD_STYLE: Record<Priority, { bg: string; border: string }> = {
   low:      { bg: "rgba(220,252,231,0.68)", border: "rgba(22,163,74,0.36)" },
 };
 
-const cream = "#f5f1ea", bg = "#e8e4dc", ink = "#1a1917", muted = "#8a7f6e";
-const dimmed = "#a09585", accent = "#5b3ff8", border = "rgba(0,0,0,0.08)";
-const card = "rgba(255,255,255,0.75)";
+// Theme-aware palette. These resolve to CSS custom properties defined in
+// index.css (:root for light, [data-theme="dark"] for dark), so flipping the
+// document's data-theme repaints every inline style that reads them. The
+// accent stays a concrete hex because it is passed to SVG presentation
+// attributes (stroke/fill) and must resolve identically everywhere.
+const cream = "var(--cream)", bg = "var(--bg)", ink = "var(--ink)", muted = "var(--muted)";
+const dimmed = "var(--muted-4)", accent = "#5b3ff8", border = "var(--border-soft)";
+const card = "var(--surface)";
+// Fixed, never themed: a QR code must stay dark-on-white to remain scannable.
+const qrInk = "#1a1917";
 
 /**
  * Map coordinates are PERCENTAGES 0-100 of the floor-map extent, never 0-1.
@@ -353,7 +431,7 @@ function QRCodeSVG({ value }: { value: string }) {
     <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} style={{ borderRadius: 8 }} shapeRendering="crispEdges">
       <rect width={size} height={size} fill="white" />
       {modules.dark.map(([r, c]) => (
-        <rect key={`${r}-${c}`} x={(c + quiet) * cell} y={(r + quiet) * cell} width={cell} height={cell} fill={ink} />
+        <rect key={`${r}-${c}`} x={(c + quiet) * cell} y={(r + quiet) * cell} width={cell} height={cell} fill={qrInk} />
       ))}
     </svg>
   );
@@ -1506,17 +1584,21 @@ function CreateStep2({ eventData, onChange, onNext, onBack }: { eventData: Parti
   };
 
   return (
-    <div className="flex-1 flex flex-col px-5 pt-4 pb-8" style={{ background: cream }}>
+    <div className="flex-1 min-h-0 flex flex-col px-5 pt-4 pb-8" style={{ background: cream }}>
       <BackBtn onBack={onBack} />
-      <div className="mt-4 mb-6">
+      <div className="mt-4 mb-6 shrink-0">
         <p className="text-[10px] font-mono uppercase tracking-widest" style={{ color: muted }}>Step 2 of 3</p>
         <h2 className="text-xl font-bold mt-1" style={{ color: ink, letterSpacing: "-0.02em" }}>Upload Floor Plan</h2>
         <p className="text-sm mt-1" style={{ color: muted }}>This will be shown as the venue map to all participants.</p>
       </div>
       <input ref={fileRef} type="file" accept="image/*" className="hidden" onChange={(e) => { void onFileChosen(e); }} />
+      {/* The preview/upload area is the only part allowed to shrink (min-h-0)
+          and is capped at 60vh, so a tall portrait map can never grow the
+          column past the viewport and push the pinned action button below the
+          fold. object-contain keeps the whole map visible, letterboxed. */}
       {!uploaded ? (
         <button onClick={pickFile} disabled={busy}
-          className="flex-1 flex flex-col items-center justify-center gap-3 rounded-3xl border-2 border-dashed active:scale-[0.98] transition-all"
+          className="flex-1 min-h-0 shrink max-h-[60vh] flex flex-col items-center justify-center gap-3 rounded-3xl border-2 border-dashed active:scale-[0.98] transition-all"
           style={{ borderColor: "rgba(91,63,248,0.3)", background: "rgba(91,63,248,0.04)" }}>
           <div className="w-14 h-14 rounded-2xl flex items-center justify-center" style={{ background: "rgba(91,63,248,0.1)" }}>
             <svg width="26" height="26" viewBox="0 0 26 26" fill="none">
@@ -1529,19 +1611,20 @@ function CreateStep2({ eventData, onChange, onNext, onBack }: { eventData: Parti
           </div>
         </button>
       ) : (
-        <div className="flex-1 flex flex-col gap-3">
-          <div className="flex-1 rounded-3xl overflow-hidden relative" style={{ border: "2px solid rgba(91,63,248,0.3)" }}>
-            <img src={eventData.mapPreviewUrl ?? campusMap} alt="Uploaded floor plan" className="w-full h-full object-cover" />
+        <div className="flex-1 min-h-0 shrink flex flex-col gap-3">
+          <div className="flex-1 min-h-0 max-h-[60vh] rounded-3xl overflow-hidden relative flex items-center justify-center" style={{ border: "2px solid rgba(91,63,248,0.3)", background: "var(--surface-2)" }}>
+            <img src={eventData.mapPreviewUrl ?? campusMap} alt="Uploaded floor plan" className="w-full h-full object-contain" />
             <div className="absolute top-3 right-3 px-3 py-1 rounded-full text-xs font-semibold flex items-center gap-1.5"
               style={{ background: "rgba(22,163,74,0.9)", color: "white" }}>
               <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2 6l3 3 5-5" stroke="white" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" /></svg>
               Uploaded
             </div>
           </div>
-          <button onClick={() => onChange({ ...eventData, floorPlanUploaded: false, mapStorageId: undefined, mapWidth: undefined, mapHeight: undefined, mapPreviewUrl: undefined })} className="text-xs font-mono text-center py-2" style={{ color: muted }}>Replace file</button>
+          <button onClick={() => onChange({ ...eventData, floorPlanUploaded: false, mapStorageId: undefined, mapWidth: undefined, mapHeight: undefined, mapPreviewUrl: undefined })} className="text-xs font-mono text-center py-2 shrink-0" style={{ color: muted }}>Replace file</button>
         </div>
       )}
-      <button onClick={onNext} disabled={!uploaded} className="w-full py-4 rounded-2xl font-semibold text-sm text-white mt-4"
+      {/* shrink-0: the action button is pinned and always visible. */}
+      <button onClick={onNext} disabled={!uploaded} className="w-full py-4 rounded-2xl font-semibold text-sm text-white mt-4 shrink-0"
         style={{ background: accent, opacity: uploaded ? 1 : 0.4, cursor: uploaded ? "pointer" : "not-allowed" }}>Next: Assign Staff</button>
     </div>
   );
@@ -3998,7 +4081,7 @@ export default function App() {
           window from 640px. Always the `cream` token behind simple screens,
           which sit straight on it. The two workspaces switch to the `bg`
           token from 640px so their map and panel cards stand out. */}
-      <div className={`relative flex flex-col overflow-hidden app-frame ${screen === "app" || screen === "staff-app" ? "bg-[#f5f1ea] sm:bg-[#e8e4dc]" : "bg-[#f5f1ea]"}`}>
+      <div className={`relative flex flex-col overflow-hidden app-frame ${screen === "app" || screen === "staff-app" ? "frame-workspace" : "frame-simple"}`}>
         {/* Critical statement modal — rendered at root so it's never clipped */}
         {criticalStatementFor && (
           <CriticalStatementModal
@@ -4015,10 +4098,11 @@ export default function App() {
             unchanged, and if env() were unsupported the calc drops and pt-3
             still applies. */}
         <div className="flex items-center justify-between px-6 pt-3 pb-1 z-20 relative shrink-0"
-          style={{ color: "#6b6456", paddingTop: "calc(0.75rem + env(safe-area-inset-top))" }}>
+          style={{ color: "var(--muted-2)", paddingTop: "calc(0.75rem + env(safe-area-inset-top))" }}>
           {/* The row stays on every screen for the notch inset; only the
               label is hidden on the login screen, whose own title names the app. */}
-          {screen !== "login" && <span className="text-[11px] font-mono font-medium">EventPulse</span>}
+          {screen !== "login" ? <span className="text-[11px] font-mono font-medium">EventPulse</span> : <span />}
+          <ThemeToggle />
         </div>
         <div className="flex-1 flex flex-col overflow-hidden min-h-0 relative">
           {screen === "app" || screen === "staff-app" ? renderContent() : (
