@@ -30,6 +30,13 @@ import type { DataModel } from "./dataModel.js";
 type Env = {
   readonly CONVEX_CLOUD_URL: string;
   readonly CONVEX_SITE_URL: string;
+  readonly EVENTPULSE_AI_ENABLED: string | undefined;
+  readonly OPENAI_API_KEY: string | undefined;
+  readonly OPENAI_API_MODE: "responses" | "chat" | undefined;
+  readonly OPENAI_BASE_URL: string | undefined;
+  readonly OPENAI_EMBEDDING_MODEL: string | undefined;
+  readonly OPENAI_TEXT_MODEL: string | undefined;
+  readonly OPENAI_VISION_MODEL: string | undefined;
 };
 
 /**

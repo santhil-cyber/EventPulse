@@ -48,7 +48,7 @@ const AGENTS: AgentDef[] = [
     id: "intake",
     num: "1",
     name: "Intake Agent",
-    tagline: "NLP, Vision & Dedup",
+    tagline: "NLP & Dedup · optional photo analysis",
     tools: ["extract_incident_details", "find_duplicate_reports", "create_or_update_incident"],
     color: {
       bg: "bg-blue-50/70",
@@ -118,8 +118,6 @@ const AGENTS: AgentDef[] = [
 
 export function AgentPipelineVisualizer({
   eventId,
-  onSimulateFull,
-  isSimulating = false,
 }: AgentPipelineVisualizerProps) {
   const [showReasoningModal, setShowReasoningModal] = useState(false);
   const [now, setNow] = useState(Date.now());
@@ -133,6 +131,7 @@ export function AgentPipelineVisualizer({
   const activeRun = useQuery(api.agentPipeline.getActivePipelineRun, { eventId });
   const triggerSingleReport = useMutation(api.simulation.triggerSingleShowcaseReport);
   const resetRun = useMutation(api.agentPipeline.resetActivePipelineRun);
+  const retryRun = useMutation(api.agentPipeline.retryOperationalRun);
 
   // Update ticker for active elapsed timers
   useEffect(() => {
@@ -218,7 +217,7 @@ export function AgentPipelineVisualizer({
         <div className="flex items-center gap-2 flex-wrap">
           <div className="flex items-center gap-1.5 font-mono text-[11px] font-bold cc-badge-live" style={{ color: "var(--ink)" }}>
             <span className="cc-dot w-2 h-2" style={{ background: "var(--accent)", ["--cc-ring" as any]: "rgba(91,63,248,0.45)" }} />
-            <span>Autonomous 5-Agent Pipeline</span>
+            <span>{activeRun?.isDemo ? "Demo · paced pipeline" : "Live incident workflow"}</span>
           </div>
 
           {activeRun ? (
@@ -241,6 +240,7 @@ export function AgentPipelineVisualizer({
                     : "Pipeline Completed"}
               </span>
 
+              {activeRun.status === "failed" && !activeRun.isDemo && <button className="underline text-xs" onClick={() => void retryRun({ runId: activeRun._id }).catch(e => alert(e.message))}>Retry workflow</button>}
               <button
                 onClick={() => activeRun && resetRun({ runId: activeRun._id })}
                 className="w-5 h-5 rounded-full flex items-center justify-center text-[color:var(--muted)] hover:text-rose-600 hover:bg-rose-50 border border-transparent hover:border-rose-200 transition cursor-pointer"
@@ -263,7 +263,7 @@ export function AgentPipelineVisualizer({
           </span>
 
           {([
-            ["stampede", "Vision & Surge", "Demonstrates Computer Vision + Gate 3 Surge + Dijkstra Rerouting"],
+            ["stampede", "Surge Demo", "Demonstrates the scripted Gate 3 surge and Dijkstra rerouting; simulated photos are not sent to vision AI"],
             ["hindi", "Hindi Intake", "Demonstrates Multilingual NLP tokenizer on Hindi report"],
             ["medical", "Medical Post", "Demonstrates Medical Post incident + First-Aid dispatch"],
             ["fire", "Stage Fire", "Demonstrates Fire incident + Stage Evacuation route"],

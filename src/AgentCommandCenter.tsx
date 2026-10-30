@@ -3,6 +3,9 @@ import { useQuery, useMutation } from "convex/react";
 import { api } from "../convex/_generated/api";
 import type { Id } from "../convex/_generated/dataModel";
 import campusMap from "@/imports/iitd-campus-map.jpg.jpeg";
+import { ZoneTelemetryEditor } from "./ZoneTelemetryEditor";
+import { AIWorkspace } from "./AIWorkspace";
+import { ResponderRoster } from "./ResponderRoster";
 import { AgentPipelineVisualizer } from "./AgentPipelineVisualizer";
 
 interface AgentCommandCenterProps {
@@ -12,7 +15,7 @@ interface AgentCommandCenterProps {
   onSwitchToMap?: () => void;
 }
 
-type CommandSection = "overview" | "incidents" | "zones" | "routes" | "dispatch" | "analytics";
+type CommandSection = "overview" | "incidents" | "zones" | "routes" | "dispatch" | "analytics" | "ai";
 type MapLayerFilter = "all" | "incidents" | "zones" | "routes" | "responders";
 
 interface SelectedEvidence {
@@ -171,6 +174,7 @@ export function AgentCommandCenter({
   const [logSearch, setLogSearch] = useState<string>("");
   const [isSimulating, setIsSimulating] = useState(false);
   const [actionSuccess, setActionSuccess] = useState<string | null>(null);
+  const [routeError, setRouteError] = useState<{ id: Id<"routeRecommendations">; message: string } | null>(null);
   const [autoScroll, setAutoScroll] = useState(true);
   const [evidenceModal, setEvidenceModal] = useState<SelectedEvidence | null>(null);
   const [isGuideOpen, setIsGuideOpen] = useState(false);
@@ -198,12 +202,23 @@ export function AgentCommandCenter({
   const analyticsData = useQuery(api.agents.queries.getIncidentAnalytics, { eventId });
   const auditExportData = useQuery(api.agents.queries.exportAuditTrail, { eventId });
 
+  const recommendedVolunteers = zones?.reduce((total, zone) => total + zone.volunteerShortfall, 0) ?? 0;
+  const risingZones = zones?.filter((zone) => zone.flowTrend === "increasing") ?? [];
+  const availableResponders = responders?.filter((responder) => responder.isAvailable && !responder.currentTaskId).length ?? 0;
+
   // Mutations
   const triggerSimulation = useMutation(api.simulation.triggerGate3Simulation);
+  const ensureZones = useMutation(api.simulation.ensureZones);
   const verifyIncident = useMutation(api.simulation.verifyIncidentByStaff);
   const resolveIncident = useMutation(api.agents.queries.resolveIncident);
   const approveRoute = useMutation(api.agents.queries.approveRoute);
   const updateTaskStatus = useMutation(api.agents.queries.updateTaskStatus);
+
+  useEffect(() => {
+    void ensureZones({ eventId }).catch(() => {
+      // The zones query remains available if the event is being closed or the session expires.
+    });
+  }, [ensureZones, eventId]);
 
   // Auto-scroll log terminal
   useEffect(() => {
@@ -233,7 +248,7 @@ export function AgentCommandCenter({
   const handleVerify = async (incidentId: Id<"incidents">) => {
     try {
       await verifyIncident({ incidentId });
-      setActionSuccess("Incident verified by staff. Safety gate released.");
+      setActionSuccess("Staff verification recorded; response policy reevaluating.");
       setTimeout(() => setActionSuccess(null), 5000);
     } catch (err: any) {
       alert("Verification failed: " + err.message);
@@ -251,12 +266,21 @@ export function AgentCommandCenter({
   };
 
   const handleApproveRoute = async (recId: Id<"routeRecommendations">) => {
+    setRouteError(null);
     try {
       await approveRoute({ recommendationId: recId });
-      setActionSuccess("Evacuation detour route approved for attendee navigation.");
+      setActionSuccess("Capacity-checked route approved for guidance.");
       setTimeout(() => setActionSuccess(null), 5000);
-    } catch (err: any) {
-      alert("Failed to approve route: " + err.message);
+    } catch (err: unknown) {
+      const details = err instanceof Error ? err.message : "";
+      const message = details.includes("VERIFIED")
+        ? "Verify the linked incident before approving public guidance."
+        : details.includes("expired") || details.includes("inactive")
+          ? "This proposal expired. Update telemetry to calculate a fresh route."
+          : details.includes("changed") || details.includes("capacity") || details.includes("safe")
+            ? "Venue conditions changed. Reassess the corridor and calculate a fresh route."
+            : "Approval failed. Review the incident and current venue conditions.";
+      setRouteError({ id: recId, message });
     }
   };
 
@@ -541,6 +565,7 @@ export function AgentCommandCenter({
                     { id: "routes", label: "Evacuation Corridors", count: routes?.length },
                     { id: "dispatch", label: "Responders", count: dispatchTasks?.length },
                     { id: "analytics", label: "Audit & Telemetry", count: undefined },
+                    { id: "ai", label: "AI & Venue Knowledge", count: undefined },
                   ].map((tab) => {
                     const active = section === tab.id;
                     return (
@@ -563,6 +588,7 @@ export function AgentCommandCenter({
 
                 {/* Console Content Panes */}
                 <div className="flex-1 min-h-0 overflow-y-auto p-3 sm:p-4 flex flex-col gap-3 custom-scrollbar">
+                  {section === "ai" && <AIWorkspace key={eventId} eventId={eventId} organizer={role === "organizer"} />}
                   {/* TAB 1: REAL-TIME AGENT AUDIT LOG */}
                   {section === "overview" && (
                     <div className="flex flex-col gap-2.5 h-full min-h-0">
@@ -638,13 +664,13 @@ export function AgentCommandCenter({
                       </div>
                       <div className="space-y-3">
                         {activeIncidents.length === 0 ? (
-                          <div className="cc-surface rounded-2xl p-8 text-center text-[color:var(--muted)]">No active safety incidents. All sectors clear.</div>
+                          <div className="cc-surface rounded-2xl p-8 text-center text-[color:var(--muted)]">No active incidents in this view. Check telemetry and staff reports for current conditions.</div>
                         ) : (
                           activeIncidents.map((inc) => {
                             const isVerified = inc.verificationStatus === "VERIFIED";
                             const isCorroborated = inc.verificationStatus === "CORROBORATED";
                             const avgTrust = inc.averageTrustScore ?? 60;
-                            const hasLinkedTask = dispatchTasks?.some((t) => t.incidentId === inc._id) ?? false;
+                            const hasLinkedTask = dispatchTasks?.some((t) => t.incidentId === inc._id && (t.purpose ?? "response") === "response") ?? false;
                             return (
                               <div key={inc._id} className={`cc-card cc-rail cc-rise p-4 pl-[18px] flex flex-col gap-3 ${isVerified ? "ring-1 ring-emerald-400/20" : ""}`} style={{ ["--cc-rail" as any]: isVerified ? "#16a34a" : isCorroborated ? "#d97706" : inc.severity === "critical" ? "#dc2626" : "var(--muted)" }}>
                                 <div className="flex items-start justify-between gap-2">
@@ -674,9 +700,9 @@ export function AgentCommandCenter({
                                     <img src={inc.imageUrl} alt="Incident Evidence" className="w-16 h-12 object-cover rounded-xl border border-[color:var(--border)]" />
                                     <div className="flex-1 min-w-0">
                                       <div className="flex items-center gap-1.5">
-                                        <span className="text-[10px] font-mono font-semibold px-2 py-0.5 rounded-full bg-blue-100 text-blue-800 border border-blue-200">Computer Vision Verified ({inc.imageConfidence ?? 94}%)</span>
+                                        <span className="text-[10px] font-mono font-semibold px-2 py-0.5 rounded-full bg-blue-100 text-blue-800 border border-blue-200">{inc.aiAnalysisId ? "AI observations available · staff verification applies" : "Photo attached · unverified evidence"}</span>
                                       </div>
-                                      <p className="text-xs truncate mt-1 text-[color:var(--ink-softer)]">{inc.imageAnalysis ?? "Visual evidence matches semantic report criteria."}</p>
+                                      <p className="text-xs truncate mt-1 text-[color:var(--ink-softer)]">{inc.imageAnalysis ?? "Image not analyzed; staff review required."}</p>
                                     </div>
                                     <span className="text-xs text-[#5b3ff8] font-bold font-mono inline-flex items-center gap-1">Inspect<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12h14M13 6l6 6-6 6" /></svg></span>
                                   </div>
@@ -697,6 +723,11 @@ export function AgentCommandCenter({
                                   </div>
                                 </div>
                                 <p className="text-xs leading-relaxed p-3 rounded-xl bg-[var(--surface)] border border-[color:var(--border)] text-[color:var(--ink-soft)]">{inc.description}</p>
+                                {!inc.isResolved && isVerified && hasLinkedTask && (
+                                  <p className="text-xs leading-relaxed p-3 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-900">
+                                    When staff marks the response task completed, this verified incident is automatically resolved after all response tasks are finished. Verification visits do not close incidents.
+                                  </p>
+                                )}
                                 <div className="flex items-center justify-between pt-1 border-t border-[color:var(--border)] gap-2 flex-wrap">
                                   <span className="text-[10px] font-mono text-[color:var(--muted)]">Reason: {inc.verificationReason ?? "Evaluating..."}</span>
                                   <div className="flex items-center gap-2">
@@ -721,32 +752,114 @@ export function AgentCommandCenter({
                   {section === "zones" && (
                     <div className="space-y-3 font-sans">
                       <div className="flex items-center justify-between">
-                        <h2 className="text-xs font-mono font-bold uppercase tracking-wider text-[color:var(--muted-2)]">Crowd Density &amp; Zone Risk ({zones?.length ?? 0})</h2>
-                        <span className="text-xs text-[color:var(--muted)]">Crowd Intelligence Agent</span>
+                        <h2 className="text-xs font-mono font-bold uppercase tracking-wider text-[color:var(--muted-2)]">
+                          Crowd Density & Zone Risk ({zones?.length ?? 0})
+                        </h2>
+                        <span className="text-xs text-[color:var(--muted)]">
+                          Crowd Intelligence Agent
+                        </span>
                       </div>
+
+                      {zones && zones.length > 0 && (
+                        <div className={`rounded-2xl border p-3 ${recommendedVolunteers > 0 && risingZones.length > 0 ? "border-amber-200 bg-amber-50" : "border-[color:var(--border)] bg-[var(--surface)]"}`}>
+                          <div className="flex flex-wrap items-start justify-between gap-3">
+                            <div>
+                                <div className="text-[10px] font-mono uppercase tracking-wider font-bold text-[color:var(--muted)]">Automatic mobilization</div>
+                              <div className="mt-1 text-sm font-bold text-[color:var(--ink)]">
+                                {recommendedVolunteers > 0 ? `Assigning ${recommendedVolunteers} more volunteers / marshals` : "All required volunteer posts are covered"}
+                              </div>
+                              <p className="mt-1 text-[11px] text-[color:var(--muted-2)]">
+                                {risingZones.length > 0
+                                  ? `Increasing crowd pressure: ${risingZones.map((zone) => `${zone.name} (+${zone.netFlow}/min)`).join(", ")}`
+                                  : "No zone has an increasing flow trend right now."}
+                              </p>
+                            </div>
+                            <div className="text-right text-[10px] text-[color:var(--muted-2)]">
+                              <span className="block uppercase tracking-wide text-[color:var(--muted)]">Responder coverage</span>
+                              <span className="font-mono font-semibold text-[color:var(--ink)]">{availableResponders} available</span>
+                              <span className="block">Assignments update automatically as risk and availability change</span>
+                            </div>
+                          </div>
+                        </div>
+                      )}
+
                       <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                         {zones?.map((zone) => {
-                          const isHigh = zone.riskScore > 60;
+                          const isHigh = zone.riskScore >= 60;
                           const isMed = zone.riskScore > 30 && zone.riskScore <= 60;
+
                           return (
-                            <div key={zone._id} className="cc-card p-3.5 space-y-2">
+                            <div
+                              key={zone._id}
+                              className="p-3.5 rounded-2xl bg-[var(--surface)] border border-[color:var(--border)] space-y-2 shadow-2xs"
+                            >
                               <div className="flex items-center justify-between">
-                                <span className="text-xs font-bold text-[color:var(--ink)]">{zone.name}</span>
-                                <span className={`px-2 py-0.5 rounded-full text-[10px] font-mono font-bold border ${isHigh ? "bg-rose-50 text-rose-700 border-rose-200" : isMed ? "bg-amber-50 text-amber-700 border-amber-200" : "bg-emerald-50 text-emerald-700 border-emerald-200"}`}>{zone.riskScore}% Risk</span>
+                                <span className="text-xs font-bold text-[color:var(--ink)]">
+                                  {zone.name}
+                                </span>
+                                <span
+                                  className={`px-2 py-0.5 rounded-full text-[10px] font-mono font-bold border ${isHigh
+                                    ? "bg-rose-50 text-rose-700 border-rose-200"
+                                    : isMed
+                                      ? "bg-amber-50 text-amber-700 border-amber-200"
+                                      : "bg-emerald-50 text-emerald-700 border-emerald-200"
+                                    }`}
+                                >
+                                  {zone.riskScore}% Risk
+                                </span>
                               </div>
+
                               <div className="space-y-1">
                                 <div className="flex justify-between text-[11px] text-[color:var(--muted-2)]">
                                   <span>Occupancy:</span>
-                                  <span className="font-mono font-semibold text-[color:var(--ink)]">{zone.currentOccupancy} / {zone.capacity}</span>
+                                  <span className="font-mono font-semibold text-[color:var(--ink)]">
+                                    {zone.currentOccupancy} / {zone.capacity}
+                                  </span>
                                 </div>
                                 <div className="w-full rounded-full h-1.5 bg-[var(--bg)] overflow-hidden">
-                                  <div className={`h-full rounded-full ${isHigh ? "bg-[#dc2626]" : isMed ? "bg-[#d97706]" : "bg-[#16a34a]"}`} style={{ width: `${Math.min(100, Math.round((zone.currentOccupancy / (zone.capacity || 1)) * 100))}%` }} />
+                                  <div
+                                    className={`h-full rounded-full ${isHigh ? "bg-[#dc2626]" : isMed ? "bg-[#d97706]" : "bg-[#16a34a]"
+                                      }`}
+                                    style={{
+                                      width: `${Math.min(100, Math.round((zone.currentOccupancy / (zone.capacity || 1)) * 100))}%`,
+                                    }}
+                                  />
                                 </div>
                               </div>
+
                               <div className="text-[10px] font-mono text-[color:var(--muted)] flex items-center justify-between pt-1">
-                                <span>Inflow: {zone.inflowRate}/min</span>
-                                <span className="font-bold">{isHigh ? "SURGE CHOKEPOINT" : isMed ? "MODERATE" : "SAFE"}</span>
+                                <span>Flow: +{zone.inflowRate} / -{zone.outflowRate} per min</span>
+                                <span className="font-bold">
+                                  {zone.telemetryStale || !zone.telemetryAt ? "DATA STALE" : isHigh ? "HIGH RISK" : isMed ? "MODERATE" : "LOWER RISK"}
+                                </span>
                               </div>
+                              <div className="grid grid-cols-2 gap-2 border-t border-[color:var(--border)] pt-2 text-[10px]">
+                                <div className="text-[color:var(--muted-2)]">
+                                  <span className="block uppercase tracking-wide text-[color:var(--muted)]">5-min forecast</span>
+                                  <span className="font-mono font-semibold text-[color:var(--ink)]">
+                                    {zone.projectedOccupancy} people ({zone.projectedDensity}% capacity)
+                                  </span>
+                                </div>
+                                <div className="text-right text-[color:var(--muted-2)]">
+                                  <span className="block uppercase tracking-wide text-[color:var(--muted)]">Flow trend</span>
+                                  <span className="font-semibold text-[color:var(--ink)]">
+                                    {zone.flowTrend} ({zone.netFlow > 0 ? "+" : ""}{zone.netFlow}/min)
+                                  </span>
+                                </div>
+                              </div>
+                              <div className="border-t border-[color:var(--border)] pt-2 text-[10px] text-[color:var(--muted-2)]">
+                                <span className="uppercase tracking-wide text-[color:var(--muted)]">Volunteer posts</span>
+                                <span className="ml-2 font-mono font-semibold text-[color:var(--ink)]">{zone.assignedVolunteerCount} / {zone.additionalVolunteersNeeded} assigned</span>
+                              </div>
+                              {zone.riskFactors && (
+                                <p className="text-[10px] leading-relaxed text-[color:var(--muted-2)]">{zone.riskFactors}</p>
+                              )}
+                              {zone.volunteerShortfall > 0 && (
+                                <div className="text-[10px] font-semibold text-rose-700">
+                                  Auto-assigning +{zone.volunteerShortfall} volunteers / marshals
+                                </div>
+                              )}
+                              <ZoneTelemetryEditor zone={zone} organizer={role === "organizer"} />
                             </div>
                           );
                         })}
@@ -758,34 +871,60 @@ export function AgentCommandCenter({
                   {section === "routes" && (
                     <div className="space-y-3 font-sans">
                       <div className="flex items-center justify-between">
-                        <h2 className="text-xs font-mono font-bold uppercase tracking-wider text-[color:var(--muted-2)]">Dijkstra Evacuation Corridors ({routes?.length ?? 0})</h2>
+                        <h2 className="text-xs font-mono font-bold uppercase tracking-wider text-[color:var(--muted-2)]">
+                          Dijkstra Evacuation Corridors ({routes?.length ?? 0})
+                        </h2>
                         <span className="text-xs text-[color:var(--muted)]">Routing Agent</span>
                       </div>
+
                       {routes && routes.length === 0 ? (
-                        <div className="cc-surface rounded-2xl p-8 text-center text-[color:var(--muted)]">No active evacuation reroutes. Standard corridors are unobstructed.</div>
+                        <div className="p-8 text-center rounded-2xl bg-[var(--surface)] border border-[color:var(--border)] text-[color:var(--muted)]">
+                          {zones?.some(zone => zone.telemetryStale || !zone.telemetryAt)
+                            ? `${zones.filter(zone => zone.telemetryStale || !zone.telemetryAt).length} zones have stale telemetry. Confirm corridor and exit observations before routing.`
+                            : "No active route is feasible or awaiting approval. Check the routing decisions in Activity Log."}
+                        </div>
                       ) : (
                         routes?.map((rt) => (
-                          <div key={rt._id} className="cc-card p-4 space-y-2.5">
-                            <div className="flex items-center justify-between gap-2 flex-wrap">
-                              <span className="text-xs font-bold flex items-center gap-1.5" style={{ color: "var(--ink)" }}>
-                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ color: "var(--muted)" }}><circle cx="6" cy="19" r="3" /><path d="M9 19h8.5a3.5 3.5 0 0 0 0-7h-11a3.5 3.5 0 0 1 0-7H15" /><circle cx="18" cy="5" r="3" /></svg>
+                          <div
+                            key={rt._id}
+                            className="p-4 rounded-2xl bg-[var(--surface)] border border-[color:var(--border)] space-y-2.5 shadow-2xs"
+                          >
+                            <div className="flex items-center justify-between">
+                              <span className="text-xs font-bold text-[color:var(--ink)] flex items-center gap-1.5">
+                                <span>🗺️</span>
                                 <span>{rt.affectedZoneName}</span>
                               </span>
-                              <span className="px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold bg-purple-50 text-purple-700 border border-purple-200">{rt.isEvacuation ? "Emergency Evacuation" : "Dynamic Detour"}</span>
+                              <span className="px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold bg-purple-50 text-purple-700 border border-purple-200">
+                                {rt.isEvacuation ? "Emergency Evacuation" : "Dynamic Detour"}
+                              </span>
                             </div>
-                            <p className="text-xs p-3 rounded-xl border leading-relaxed" style={{ background: "var(--surface)", borderColor: "var(--border)", color: "var(--ink-soft)" }}>{rt.instruction}</p>
-                            <div className="flex items-center justify-between pt-1 gap-2 flex-wrap">
-                              <span className="text-[11px] inline-flex items-center gap-1.5" style={{ color: "var(--muted)" }}>
-                                {rt.requiresApproval ? (
-                                  <><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#d97706" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h16.9a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" /><path d="M12 9v4M12 17h.01" /></svg>Control Room Approval Required</>
-                                ) : (
-                                  <><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#16a34a" strokeWidth="2.8" strokeLinecap="round" strokeLinejoin="round"><path d="M20 6 9 17l-5-5" /></svg>Active Broadcast</>
-                                )}
+
+                            <p className="text-xs p-3 rounded-xl bg-[var(--surface)] border border-[color:var(--border)] text-[color:var(--ink-soft)] leading-relaxed">
+                              {rt.instruction}
+                            </p>
+                            <span className="text-[11px] font-semibold text-[color:var(--muted-2)]">Wave capacity: {rt.plannedPeople ?? 1} people</span>
+
+                            <div className="flex items-center justify-between pt-1">
+                              <span className="text-[11px] text-[color:var(--muted)]">
+                                {rt.requiresApproval
+                                  ? rt.approvalReady ? "Control-room approval required" : `${rt.incidentCode}: ${rt.incidentVerificationStatus} · verification required`
+                                  : "Active broadcast"}
                               </span>
                               {rt.requiresApproval && (
-                                <button onClick={() => handleApproveRoute(rt._id)} className="px-3 py-1.5 rounded-xl text-xs font-semibold text-white bg-[#5b3ff8] hover:bg-[#4d32e6] transition cursor-pointer shadow-xs">Approve &amp; Broadcast</button>
+                                <div className="flex items-center gap-2">
+                                  {!rt.approvalReady && <button onClick={() => setSection("incidents")} className="text-xs font-semibold text-[#5b3ff8] underline">Review incident</button>}
+                                  <button
+                                    onClick={() => handleApproveRoute(rt._id)}
+                                    disabled={!rt.approvalReady}
+                                    title={!rt.approvalReady ? "Incident must be verified before public guidance" : "Approve this route for public guidance"}
+                                    className="px-3 py-1.5 rounded-xl text-xs font-semibold text-white bg-[#5b3ff8] hover:bg-[#4d32e6] transition cursor-pointer shadow-xs disabled:cursor-not-allowed disabled:opacity-40"
+                                  >
+                                    Approve & Broadcast
+                                  </button>
+                                </div>
                               )}
                             </div>
+                            {routeError?.id === rt._id && <p role="alert" className="text-xs text-red-700">{routeError.message}</p>}
                           </div>
                         ))
                       )}
@@ -795,29 +934,71 @@ export function AgentCommandCenter({
                   {/* TAB 5: RESPONDERS & DISPATCH */}
                   {section === "dispatch" && (
                     <div className="space-y-3 font-sans">
+                      <ResponderRoster key={eventId} eventId={eventId} organizer={role === "organizer"} />
                       <div className="flex items-center justify-between">
-                        <h2 className="text-xs font-mono font-bold uppercase tracking-wider text-[color:var(--muted-2)]">Responder Dispatch &amp; Tasks ({dispatchTasks?.length ?? 0})</h2>
+                        <h2 className="text-xs font-mono font-bold uppercase tracking-wider text-[color:var(--muted-2)]">
+                          Responder Dispatch & Tasks ({dispatchTasks?.length ?? 0})
+                        </h2>
                         <span className="text-xs text-[color:var(--muted)]">Smart Dispatch Agent</span>
                       </div>
+
                       {dispatchTasks && dispatchTasks.length === 0 ? (
-                        <div className="cc-surface rounded-2xl p-8 text-center text-[color:var(--muted)]">No active tasks. All responders on standby.</div>
+                        <div className="p-8 text-center rounded-2xl bg-[var(--surface)] border border-[color:var(--border)] text-[color:var(--muted)]">
+                          No dispatch tasks yet. Check the responder roster and Activity Log for availability and assignment outcomes.
+                        </div>
                       ) : (
                         dispatchTasks?.map((task) => (
-                          <div key={task._id} className="cc-card p-4 space-y-2.5">
-                            <div className="flex items-center justify-between gap-2 flex-wrap">
+                          <div
+                            key={task._id}
+                            className="p-4 rounded-2xl bg-[var(--surface)] border border-[color:var(--border)] space-y-2.5 shadow-2xs"
+                          >
+                            <div className="flex items-center justify-between">
                               <div className="flex items-center gap-2">
-                                <span className="text-xs font-bold font-mono text-[color:var(--ink)]">Task #{task._id.slice(-4)}</span>
-                                <span className={`px-2 py-0.5 rounded-full text-[10px] font-mono font-bold uppercase border ${task.status === "completed" ? "bg-emerald-50 text-emerald-700 border-emerald-200" : task.status === "en_route" ? "bg-blue-50 text-blue-700 border-blue-200" : "bg-amber-50 text-amber-700 border-amber-200"}`}>{task.status}</span>
+                                <span className="text-xs font-bold font-mono text-[color:var(--ink)]">
+                                  Task #{task._id.slice(-4)}
+                                </span>
+                                <span
+                                  className={`px-2 py-0.5 rounded-full text-[10px] font-mono font-bold uppercase border ${task.status === "completed"
+                                    ? "bg-emerald-50 text-emerald-700 border-emerald-200"
+                                    : task.status === "en_route"
+                                      ? "bg-blue-50 text-blue-700 border-blue-200"
+                                      : "bg-amber-50 text-amber-700 border-amber-200"
+                                    }`}
+                                >
+                                  {task.status}
+                                </span>
                               </div>
-                              <span className="text-xs font-mono text-[color:var(--muted)]">ETA: {task.estimatedEta ?? 120}s · {task.distanceMeters ?? 45}m</span>
+                              <span className="text-xs font-mono text-[color:var(--muted)]">
+                                Estimated ETA: {task.estimatedEta !== undefined ? `${task.estimatedEta}s` : "unknown"} · {task.distanceMeters !== undefined ? `${task.distanceMeters}m` : "distance unknown"}
+                              </span>
                             </div>
-                            <p className="text-xs p-3 rounded-xl bg-[var(--surface)] border border-[color:var(--border)] text-[color:var(--ink-soft)]">{task.instruction}</p>
+
+                            <p className="text-xs p-3 rounded-xl bg-[var(--surface)] border border-[color:var(--border)] text-[color:var(--ink-soft)]">
+                              {task.instruction}
+                            </p>
+
                             <div className="flex items-center justify-end gap-2 pt-1">
                               {task.status === "pending" && (
-                                <button onClick={() => handleUpdateTask(task._id, "en_route")} className="px-3 py-1 rounded-xl text-xs font-semibold text-white bg-[#2563eb] hover:bg-blue-600 cursor-pointer shadow-xs">Set En Route</button>
+                                <button
+                                  onClick={() => handleUpdateTask(task._id, "accepted")}
+                                  className="px-3 py-1 rounded-xl text-xs font-semibold text-white bg-[#2563eb] hover:bg-blue-600 cursor-pointer shadow-xs"
+                                >
+                                  Accept Task
+                                </button>
+                              )}
+                              {task.status === "accepted" && (
+                                <button onClick={() => handleUpdateTask(task._id, "en_route")} className="px-3 py-1 rounded-xl text-xs font-semibold text-white bg-blue-600 cursor-pointer">Set En Route</button>
                               )}
                               {task.status === "en_route" && (
-                                <button onClick={() => handleUpdateTask(task._id, "completed")} className="px-3 py-1 rounded-xl text-xs font-semibold text-white bg-[#16a34a] hover:bg-[#15803d] cursor-pointer shadow-xs">Mark Completed</button>
+                                <button onClick={() => handleUpdateTask(task._id, "on_scene")} className="px-3 py-1 rounded-xl text-xs font-semibold text-white bg-blue-600 cursor-pointer">Mark On Scene</button>
+                              )}
+                              {task.status === "on_scene" && (
+                                <button
+                                  onClick={() => handleUpdateTask(task._id, "completed")}
+                                  className="px-3 py-1 rounded-xl text-xs font-semibold text-white bg-[#16a34a] hover:bg-[#15803d] cursor-pointer shadow-xs"
+                                >
+                                  Mark Completed
+                                </button>
                               )}
                             </div>
                           </div>
@@ -990,12 +1171,23 @@ export function AgentCommandCenter({
                     <div style={{ position: "absolute", inset: 0, transform: `translate(${mapOffset.x}px, ${mapOffset.y}px) scale(${mapScale})`, transformOrigin: "center center", transition: mapDragRef.current ? "none" : "transform 0.2s ease-out" }}>
                       <img src={mapUrl ?? campusMap} alt="Floor Plan" className="w-full h-full object-contain select-none pointer-events-none" draggable={false} />
                       <svg className="absolute inset-0 w-full h-full pointer-events-none z-10" viewBox="0 0 100 100" preserveAspectRatio="none">
-                        {(mapLayer === "all" || mapLayer === "routes") && routes && routes.map((rt) => (
-                          <g key={rt._id}>
-                            <path d="M 65 45 Q 60 55 50 90" fill="none" stroke="#16a34a" strokeWidth="1.6" strokeDasharray="3, 2" className="animate-route-flow" />
-                            <path d="M 65 45 Q 75 42 85 40" fill="none" stroke="#5b3ff8" strokeWidth="1.6" strokeDasharray="3, 2" className="animate-route-flow" />
-                          </g>
-                        ))}
+                        {(mapLayer === "all" || mapLayer === "routes") &&
+                          routes &&
+                          routes.map((rt) => {
+                            let points = "";
+                            try {
+                              const ids: unknown = JSON.parse(rt.routePath);
+                              if (Array.isArray(ids) && ids.every(id => typeof id === "string")) {
+                                const coordinates = ids.map(id => {
+                                  const zone = zones?.find(z => z._id === id);
+                                  return zone ? `${zone.pinX},${zone.pinY}` : "";
+                                });
+                                if (coordinates.every(Boolean)) points = coordinates.join(" ");
+                              }
+                            } catch { /* Invalid historical paths are not drawn. */ }
+                            return points ? <polyline key={rt._id} points={points} fill="none" stroke={rt.requiresApproval ? "#a16207" : "#16a34a"} strokeWidth="1.6" strokeDasharray={rt.requiresApproval ? "2,2" : undefined} /> : null;
+                          })}
+
                         {(mapLayer === "all" || mapLayer === "responders") && dispatchTasks && dispatchTasks.filter((t) => t.status === "en_route" || t.status === "accepted" || t.status === "pending").map((task) => {
                           const responder = responders?.find((r) => r._id === task.responderId);
                           const incident = incidents?.find((i) => i._id === task.incidentId);
@@ -1083,7 +1275,7 @@ export function AgentCommandCenter({
             <div className="space-y-4 text-xs leading-relaxed text-[color:var(--ink-soft)]">
               <div className="cc-surface rounded-2xl p-3.5">
                 <h4 className="font-bold text-[color:var(--ink)] text-sm mb-1">1. Intake &amp; Multi-Modal Perception</h4>
-                <p>Attendee reports are ingested via natural language and image uploads. The Intake Agent extracts location, severity, and category, and automatically initiates computer vision analysis on attached photos.</p>
+                <p>Attendee reports are ingested through deterministic text triage and image uploads. When an organizer enables AI enrichment and vision for the event, Agent 1 can send an eligible, registered photo with the report text to the configured vision model. Simulated showcase reports skip provider analysis; their example image URLs are display-only.</p>
               </div>
               <div className="cc-surface rounded-2xl p-3.5">
                 <h4 className="font-bold text-[color:var(--ink)] text-sm mb-1">2. Verification &amp; Reporter Credibility</h4>
@@ -1130,17 +1322,17 @@ export function AgentCommandCenter({
             <div className="p-3.5 rounded-2xl bg-[var(--surface)] border border-blue-200 space-y-1.5 text-xs">
               <div className="flex items-center justify-between">
                 <span className="font-semibold text-blue-900">Computer Vision Semantic Analysis:</span>
-                <span className="font-mono text-emerald-700 font-bold">Confidence: {evidenceModal.imageConfidence ?? 94}%</span>
+                <span className="font-mono text-emerald-700 font-bold">Qualitative observations</span>
               </div>
-              <p className="text-blue-950 leading-relaxed">{evidenceModal.imageAnalysis ?? "Optical analysis verified: High density crowd cluster matching description semantics."}</p>
+              <p className="text-blue-950 leading-relaxed">{evidenceModal.imageAnalysis ?? "This image has not been analyzed, or its analysis was inconclusive. Attachment presence does not verify an incident."}</p>
             </div>
             <div className="cc-surface rounded-2xl p-3.5 space-y-2 text-xs">
               <div className="flex items-center justify-between">
                 <span className="font-semibold text-[color:var(--ink)]">Reporter Credibility Rating:</span>
-                <span className="font-mono font-bold text-emerald-700">{evidenceModal.averageTrustScore ?? 85}/100</span>
+                <span className="font-mono font-bold text-emerald-700">{evidenceModal.averageTrustScore ?? 0}/100</span>
               </div>
               <div className="w-full rounded-full h-1.5 bg-[var(--bg)] overflow-hidden">
-                <div className="h-full bg-emerald-500 rounded-full" style={{ width: `${evidenceModal.averageTrustScore ?? 85}%` }} />
+                <div className="h-full bg-emerald-500 rounded-full" style={{ width: `${evidenceModal.averageTrustScore ?? 0}%` }} />
               </div>
               <p className="text-[11px] text-[color:var(--muted)]">Reports from high-trust members with corroborating visual evidence receive automated priority triage.</p>
             </div>

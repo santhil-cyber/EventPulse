@@ -1,6 +1,7 @@
 import { authTables } from "@convex-dev/auth/server";
 import { defineSchema, defineTable } from "convex/server";
 import { v } from "convex/values";
+import { aiMode, analysisOutput, analysisStatus } from "./ai/validators";
 
 /** Role lives on the membership document — never on the client, never on the user. */
 export const roleValidator = v.union(
@@ -74,6 +75,7 @@ export const dispatchStatusValidator = v.union(
   v.literal("completed"),
   v.literal("rejected"),
   v.literal("escalated"),
+  v.literal("canceled"),
 );
 
 export const agentNameValidator = v.union(
@@ -112,6 +114,7 @@ export default defineSchema({
     mapHeight: v.optional(v.number()),
     isActive: v.boolean(),
     createdAt: v.number(),
+    incidentSequence: v.optional(v.number()),
   })
     .index("by_attendeeCode", ["attendeeCode"])
     .index("by_staffCode", ["staffCode"])
@@ -153,6 +156,7 @@ export default defineSchema({
     reviewedBy: v.optional(v.id("users")),
     reviewedAt: v.optional(v.number()),
     clientId: v.string(),
+    isSimulated: v.optional(v.boolean()),
     imageStorageId: v.optional(v.id("_storage")),
     imageUrl: v.optional(v.string()),
     createdAt: v.number(),
@@ -208,6 +212,8 @@ export default defineSchema({
     imageAnalysis: v.optional(v.string()),
     imageConfidence: v.optional(v.number()),
     averageTrustScore: v.optional(v.number()),
+    aiSummary: v.optional(v.string()),
+    aiAnalysisId: v.optional(v.id("aiAnalyses")),
     createdAt: v.number(),
     updatedAt: v.number(),
   })
@@ -254,6 +260,11 @@ export default defineSchema({
     exitBlocked: v.boolean(),
     isNarrowPassage: v.boolean(),
     updatedAt: v.number(),
+    telemetryAt: v.optional(v.number()),
+    telemetrySource: v.optional(v.union(v.literal("manual"), v.literal("sensor"), v.literal("simulation"))),
+    telemetryStale: v.optional(v.boolean()),
+    isAssemblyPoint: v.optional(v.boolean()),
+    isDesignatedEgress: v.optional(v.boolean()),
   })
     .index("by_event", ["eventId"])
     .index("by_event_risk", ["eventId", "riskScore"]),
@@ -288,6 +299,8 @@ export default defineSchema({
     affectedZoneId: v.id("zones"),
     /** JSON array of zone IDs forming the path. */
     routePath: v.string(),
+    /** Maximum people assigned to this one-minute guidance wave. */
+    plannedPeople: v.optional(v.number()),
     /** Human-readable guidance text. */
     instruction: v.string(),
     isEvacuation: v.boolean(),
@@ -296,6 +309,8 @@ export default defineSchema({
     approvedAt: v.optional(v.number()),
     isActive: v.boolean(),
     createdAt: v.number(),
+    expiresAt: v.optional(v.number()),
+    graphFingerprint: v.optional(v.string()),
   })
     .index("by_event_active", ["eventId", "isActive"])
     .index("by_incident", ["incidentId"]),
@@ -310,6 +325,9 @@ export default defineSchema({
     membershipId: v.id("memberships"),
     responderType: responderTypeValidator,
     currentZoneId: v.optional(v.id("zones")),
+    /** Zone post assigned automatically by Crowd Intelligence when risk requires coverage. */
+    assignmentZoneId: v.optional(v.id("zones")),
+    assignmentAssignedAt: v.optional(v.number()),
     /** Simulated precise map position for the demo overlay. */
     posX: v.optional(v.number()),
     posY: v.optional(v.number()),
@@ -342,6 +360,9 @@ export default defineSchema({
     completedAt: v.optional(v.number()),
     escalatedToTaskId: v.optional(v.id("dispatchTasks")),
     isEmergencyDispatch: v.boolean(),
+    purpose: v.optional(v.union(v.literal("verification"), v.literal("response"))),
+    escalationCount: v.optional(v.number()),
+    simulated: v.optional(v.boolean()),
     emergencyService: v.optional(v.union(
       v.literal("ambulance"),
       v.literal("fire_brigade"),
@@ -378,6 +399,55 @@ export default defineSchema({
    * Real-time tracker for individual agent pipeline executions.
    * Powers the visible step-by-step showcase for hackathons and control room displays.
    */
+  evidenceUploads: defineTable({
+    eventId: v.id("events"), uploaderId: v.id("users"), storageId: v.id("_storage"), createdAt: v.number(),
+  }).index("by_storageId", ["storageId"]),
+
+  aiSettings: defineTable({
+    eventId: v.id("events"), mode: aiMode, visionEnabled: v.boolean(), ragEnabled: v.boolean(),
+    updatedBy: v.id("users"), updatedAt: v.number(),
+  }).index("by_eventId", ["eventId"]),
+
+  aiAnalyses: defineTable({
+    eventId: v.id("events"), reportId: v.id("reports"), incidentId: v.id("incidents"),
+    version: v.string(), promptVersion: v.string(), mode: aiMode, status: analysisStatus,
+    queuedAt: v.optional(v.number()), attempts: v.number(), inputHash: v.string(), model: v.optional(v.string()), output: v.optional(analysisOutput),
+    imageAnalyzed: v.boolean(), errorCode: v.optional(v.string()),
+    inputTokens: v.optional(v.number()), outputTokens: v.optional(v.number()),
+    createdAt: v.number(), startedAt: v.optional(v.number()), completedAt: v.optional(v.number()),
+  }).index("by_reportId_and_version", ["reportId", "version"])
+    .index("by_eventId_and_createdAt", ["eventId", "createdAt"]),
+
+  reportEmbeddings: defineTable({
+    eventId: v.id("events"), reportId: v.id("reports"), incidentId: v.id("incidents"),
+    embedding: v.array(v.float64()), model: v.string(), createdAt: v.number(),
+  }).index("by_reportId", ["reportId"]).vectorIndex("by_embedding", {
+    vectorField: "embedding", dimensions: 1536, filterFields: ["eventId"],
+  }),
+
+  duplicateSuggestions: defineTable({
+    eventId: v.id("events"), analysisId: v.id("aiAnalyses"),
+    incidentId: v.id("incidents"), candidateId: v.id("incidents"), score: v.number(),
+    status: v.union(v.literal("pending"), v.literal("dismissed")), createdAt: v.number(),
+  }).index("by_eventId_and_status", ["eventId", "status"])
+    .index("by_analysisId", ["analysisId"]),
+
+  knowledgeDocuments: defineTable({
+    eventId: v.id("events"), title: v.string(), source: v.string(), version: v.string(),
+    text: v.string(), contentHash: v.string(), createdBy: v.id("users"), createdAt: v.number(),
+    status: v.union(v.literal("draft"), v.literal("indexing"), v.literal("ready"), v.literal("failed"), v.literal("revoked")),
+    approved: v.boolean(), approvedBy: v.optional(v.id("users")), approvedAt: v.optional(v.number()),
+    indexGeneration: v.optional(v.number()),
+    embeddingModel: v.optional(v.string()), errorCode: v.optional(v.string()),
+  }).index("by_eventId_and_createdAt", ["eventId", "createdAt"]),
+
+  knowledgeChunks: defineTable({
+    eventId: v.id("events"), documentId: v.id("knowledgeDocuments"), ordinal: v.number(),
+    text: v.string(), embedding: v.array(v.float64()), model: v.string(), retrievalScope: v.string(),
+  }).index("by_documentId", ["documentId"]).vectorIndex("by_embedding", {
+    vectorField: "embedding", dimensions: 1536, filterFields: ["retrievalScope"],
+  }),
+
   pipelineRuns: defineTable({
     eventId: v.id("events"),
     incidentId: v.optional(v.id("incidents")),
@@ -410,7 +480,10 @@ export default defineSchema({
     ),
     startedAt: v.number(),
     completedAt: v.optional(v.number()),
+    dismissed: v.optional(v.boolean()),
+    isDemo: v.optional(v.boolean()),
   })
     .index("by_event_status", ["eventId", "status"])
-    .index("by_event_startedAt", ["eventId", "startedAt"]),
+    .index("by_event_startedAt", ["eventId", "startedAt"])
+    .index("by_reportId", ["reportId"]),
 });

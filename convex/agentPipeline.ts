@@ -3,6 +3,8 @@ import { internal } from "./_generated/api";
 import { internalMutation, mutation, query } from "./_generated/server";
 import type { Id } from "./_generated/dataModel";
 import type { MutationCtx } from "./_generated/server";
+import { requireRole } from "./lib/authz";
+import { safeLimit } from "./ai/policy";
 import { logAgentAction } from "./lib/agentLog";
 
 /**
@@ -65,7 +67,7 @@ async function updatePipelineProgress(
 
   if (update.agentPhase === "starting" && agent && agent !== "completed") {
     timestamps[agent] = {
-      ...(timestamps[agent] || {}),
+      ...timestamps[agent],
       startedAt: Date.now(),
     };
   }
@@ -241,7 +243,7 @@ export const step2_verification_thinking = internalMutation({
 
     await updatePipelineProgress(ctx, args.runId, {
       agentPhase: "thinking",
-      currentThought: `Evaluating multi-source trust: ${incident.independentSourceCount} independent source(s) · CV Vision conf: ${incident.imageConfidence ?? "N/A"}%`,
+      currentThought: `Evaluating eligible source accounts: ${incident.independentSourceCount}. Attached media requires review.`,
       currentTool: "analyse_media_consistency",
       agentReasoning: JSON.stringify({
         independentSources: incident.independentSourceCount,
@@ -300,7 +302,7 @@ export const step2_verification_output = internalMutation({
     const incident = await ctx.db.get("incidents", args.incidentId);
 
     const isVerified = args.newStatus === "VERIFIED";
-    const statusChip = isVerified ? "VERIFIED (Full Clearance)" : "CORROBORATED (Internal Only)";
+    const statusChip = isVerified ? "VERIFIED (Policy satisfied)" : args.newStatus === "CORROBORATED" ? "CORROBORATED (Review pending)" : "UNVERIFIED (Staff assessment required)";
 
     await updatePipelineProgress(ctx, args.runId, {
       agentPhase: "output",
@@ -510,8 +512,10 @@ export const step4_routing_tool_call = internalMutation({
       },
     );
 
-    const hasRoute = Boolean(routingResult?.route?.feasible);
-    const instruction = routingResult?.instruction ?? "Standard evacuation corridors remain passable.";
+    const hasRoute = Boolean(routingResult?.plans.length);
+    const instruction = routingResult?.plans.length
+      ? `${routingResult.plans.map(plan => plan.instruction).join(" ")}${routingResult.remaining ? ` ${routingResult.remaining} people remain on hold for supervised movement.` : ""}`
+      : "No validated route available. Follow event-control instructions.";
 
     await ctx.scheduler.runAfter(
       SHOWCASE_DELAYS.routing_tool_call,
@@ -681,7 +685,8 @@ export const step5_dispatch_output = internalMutation({
     if (!incident) return;
 
     const etaMin = Math.ceil(args.etaSeconds / 60);
-    const summary = `Unit Deployed: ${args.responderName} assigned (ETA: ~${etaMin} min, ${args.distanceMeters}m). Auto-escalation active.`;
+    const task = await ctx.db.query("dispatchTasks").withIndex("by_incident", q => q.eq("incidentId", args.incidentId)).order("desc").first();
+    const summary = task ? `Task ${task.status}: ${args.responderName} (estimated ETA ~${etaMin} min). External emergency services were not contacted.` : "No responder assigned. Operator assessment required. External emergency services were not contacted.";
 
     await updatePipelineProgress(ctx, args.runId, {
       agentPhase: "output",
@@ -691,7 +696,7 @@ export const step5_dispatch_output = internalMutation({
         assignedResponder: args.responderName,
         estimatedEtaSeconds: args.etaSeconds,
         distanceMeters: args.distanceMeters,
-        emergencyServicesCalled: incident.verificationStatus === "VERIFIED",
+        emergencyServicesCalled: false,
       }),
     });
 
@@ -742,6 +747,7 @@ export const startShowcaseRun = internalMutation({
       agentReasoning: JSON.stringify({ reportId: report._id, initialLocation: report.location }),
       agentTimestamps: JSON.stringify({ intake: { startedAt: Date.now() } }),
       status: "running",
+      isDemo: true,
       startedAt: Date.now(),
     });
 
@@ -761,6 +767,7 @@ export const startShowcaseRun = internalMutation({
 export const getActivePipelineRun = query({
   args: { eventId: v.id("events") },
   handler: async (ctx, args) => {
+    await requireRole(ctx, args.eventId, ["ORGANIZER", "STAFF"]);
     // Check if there is an actively running pipeline
     const runningRun = await ctx.db
       .query("pipelineRuns")
@@ -770,7 +777,7 @@ export const getActivePipelineRun = query({
       .order("desc")
       .first();
 
-    if (runningRun) {
+    if (runningRun && !runningRun.dismissed) {
       return runningRun;
     }
 
@@ -781,7 +788,7 @@ export const getActivePipelineRun = query({
       .order("desc")
       .first();
 
-    return lastRun;
+    return lastRun?.dismissed ? null : lastRun;
   },
 });
 
@@ -791,7 +798,8 @@ export const getActivePipelineRun = query({
 export const listRecentPipelineRuns = query({
   args: { eventId: v.id("events"), limit: v.optional(v.number()) },
   handler: async (ctx, args) => {
-    const limit = args.limit ?? 5;
+    await requireRole(ctx, args.eventId, ["ORGANIZER", "STAFF"]);
+    const limit = safeLimit(args.limit, 5, 30);
     return await ctx.db
       .query("pipelineRuns")
       .withIndex("by_event_startedAt", (q) => q.eq("eventId", args.eventId))
@@ -806,10 +814,29 @@ export const listRecentPipelineRuns = query({
 export const resetActivePipelineRun = mutation({
   args: { runId: v.id("pipelineRuns") },
   handler: async (ctx, args) => {
+    const run = await ctx.db.get("pipelineRuns", args.runId);
+    if (!run) throw new Error("Pipeline run not found.");
+    await requireRole(ctx, run.eventId, ["ORGANIZER", "STAFF"]);
     await ctx.db.patch("pipelineRuns", args.runId, {
-      status: "completed",
-      currentThought: "Pipeline reset manually by operator.",
+      dismissed: true,
+      currentThought: "Display dismissed by operator; scheduled processing continues.",
       completedAt: Date.now(),
     });
+  },
+});
+
+/** Retry operational evaluation without duplicating report intake or assignments. */
+export const retryOperationalRun = mutation({
+  args: { runId: v.id("pipelineRuns") },
+  handler: async (ctx, { runId }) => {
+    const run = await ctx.db.get("pipelineRuns", runId);
+    if (!run) throw new Error("Run not found.");
+    await requireRole(ctx, run.eventId, ["ORGANIZER", "STAFF"]);
+    if (run.status !== "failed" || run.isDemo) throw new Error("Only failed live workflows can be retried.");
+    const result = await ctx.runMutation(internal.agents.intake.processReport, { reportId: run.reportId });
+    const incident = await ctx.db.get("incidents", result.incidentId);
+    if (!incident || incident.isResolved) throw new Error("Incident is no longer active.");
+    await ctx.db.patch("pipelineRuns", runId, { status: "running", dismissed: false, incidentId: result.incidentId, completedAt: undefined });
+    await ctx.scheduler.runAfter(0, internal.orchestrator.runVerification, { incidentId: result.incidentId, runId });
   },
 });

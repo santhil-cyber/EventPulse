@@ -151,6 +151,19 @@ interface AppNotification {
   description: string; statement: string; time: string;
 }
 
+type IncidentAlertSeverity = "critical" | "high" | "medium" | "low";
+
+interface IncidentAlertRow {
+  _id: string;
+  incidentCode: string;
+  description: string;
+  location: string;
+  severity: IncidentAlertSeverity;
+  verificationStatus: string;
+  isResolved: boolean;
+  createdAt: number;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants & helpers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -607,12 +620,199 @@ function NotificationPanel({ notifications, onClose, onDismiss }: { notification
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Staff emergency alerts
+// ─────────────────────────────────────────────────────────────────────────────
+const STAFF_SOUND_KEY = "eventpulse.staffEmergencySound";
+const STAFF_NOTIFICATION_KEY = "eventpulse.staffPhoneNotifications";
+
+function readPreference(key: string): boolean {
+  try { return window.localStorage.getItem(key) === "1"; } catch { return false; }
+}
+
+function writePreference(key: string, value: boolean): void {
+  try {
+    if (value) window.localStorage.setItem(key, "1");
+    else window.localStorage.removeItem(key);
+  } catch { /* private browsing can disable local storage */ }
+}
+
+/** A short, unmistakable three-tone alarm. Mobile browsers require a prior tap. */
+function playEmergencyTone(context: AudioContext): void {
+  if (context.state === "suspended") void context.resume();
+  const now = context.currentTime;
+  const gain = context.createGain();
+  gain.gain.setValueAtTime(0.0001, now);
+  gain.connect(context.destination);
+  const tones = [880, 660, 880];
+  tones.forEach((frequency, index) => {
+    const oscillator = context.createOscillator();
+    const start = now + index * 0.34;
+    oscillator.type = "square";
+    oscillator.frequency.setValueAtTime(frequency, start);
+    oscillator.connect(gain);
+    oscillator.start(start);
+    oscillator.stop(start + 0.22);
+  });
+  gain.gain.setValueAtTime(0.22, now);
+  gain.gain.setValueAtTime(0.22, now + 0.18);
+  gain.gain.setValueAtTime(0.0001, now + 0.23);
+  gain.gain.setValueAtTime(0.22, now + 0.34);
+  gain.gain.setValueAtTime(0.22, now + 0.52);
+  gain.gain.setValueAtTime(0.0001, now + 0.57);
+  gain.gain.setValueAtTime(0.22, now + 0.68);
+  gain.gain.setValueAtTime(0.22, now + 0.86);
+  gain.gain.exponentialRampToValueAtTime(0.0001, now + 1.05);
+  window.setTimeout(() => gain.disconnect(), 1400);
+}
+
+function StaffEmergencyAlerts({ incidents }: { incidents: IncidentAlertRow[] }) {
+  // The preference is remembered for copy and diagnostics, but the Web Audio
+  // output must be unlocked by a tap on every mobile browser session.
+  const [soundEnabled, setSoundEnabled] = useState(false);
+  const [phoneEnabled, setPhoneEnabled] = useState(() => readPreference(STAFF_NOTIFICATION_KEY));
+  const [permission, setPermission] = useState<NotificationPermission | "unsupported">(() =>
+    typeof window !== "undefined" && "Notification" in window ? Notification.permission : "unsupported",
+  );
+  const [activeAlert, setActiveAlert] = useState<IncidentAlertRow | null>(null);
+  const [lastAlertAt, setLastAlertAt] = useState<number | null>(null);
+  const previousIds = useRef<Set<string> | null>(null);
+  const audioContext = useRef<AudioContext | null>(null);
+
+  const ensureAudio = useCallback(async () => {
+    if (!audioContext.current) {
+      const AudioContextCtor = window.AudioContext ??
+        (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+      if (!AudioContextCtor) throw new Error("Audio is not supported on this phone.");
+      audioContext.current = new AudioContextCtor();
+    }
+    if (audioContext.current.state === "suspended") await audioContext.current.resume();
+    return audioContext.current;
+  }, []);
+
+  const enableAlerts = useCallback(async () => {
+    try {
+      const context = await ensureAudio();
+      // A silent oscillator unlocks the audio output on iOS/Safari after the tap.
+      const oscillator = context.createOscillator();
+      const gain = context.createGain();
+      gain.gain.value = 0.0001;
+      oscillator.connect(gain).connect(context.destination);
+      oscillator.start();
+      oscillator.stop(context.currentTime + 0.03);
+      setSoundEnabled(true);
+      writePreference(STAFF_SOUND_KEY, true);
+      playEmergencyTone(context);
+    } catch {
+      setSoundEnabled(false);
+    }
+
+    if (typeof Notification !== "undefined") {
+      const nextPermission = Notification.permission === "default"
+        ? await Notification.requestPermission()
+        : Notification.permission;
+      setPermission(nextPermission);
+      const enabled = nextPermission === "granted";
+      setPhoneEnabled(enabled);
+      writePreference(STAFF_NOTIFICATION_KEY, enabled);
+    }
+  }, [ensureAudio]);
+
+  const testSound = useCallback(async () => {
+    try { playEmergencyTone(await ensureAudio()); } catch { setSoundEnabled(false); }
+  }, [ensureAudio]);
+
+  const enablePhoneNotifications = useCallback(async () => {
+    if (typeof Notification === "undefined") return;
+    const nextPermission = Notification.permission === "default"
+      ? await Notification.requestPermission()
+      : Notification.permission;
+    setPermission(nextPermission);
+    const enabled = nextPermission === "granted";
+    setPhoneEnabled(enabled);
+    writePreference(STAFF_NOTIFICATION_KEY, enabled);
+  }, []);
+
+  useEffect(() => () => {
+    void audioContext.current?.close();
+  }, []);
+
+  useEffect(() => {
+    if (!incidents) return;
+    const active = incidents.filter((incident) => !incident.isResolved);
+    const ids = new Set(active.map((incident) => incident._id));
+    if (previousIds.current === null) {
+      previousIds.current = ids;
+      return;
+    }
+    const fresh = active.filter((incident) => !previousIds.current!.has(incident._id));
+    previousIds.current = ids;
+    const incident = fresh.sort((a, b) => b.createdAt - a.createdAt)[0];
+    if (!incident) return;
+
+    setActiveAlert(incident);
+    setLastAlertAt(Date.now());
+    if (typeof navigator !== "undefined" && "vibrate" in navigator) {
+      navigator.vibrate([300, 150, 300, 150, 700]);
+    }
+    if (soundEnabled && audioContext.current) playEmergencyTone(audioContext.current);
+    if (phoneEnabled && permission === "granted" && typeof Notification !== "undefined") {
+      try {
+        new Notification(`Emergency incident · ${incident.incidentCode}`, {
+          body: `${incident.severity.toUpperCase()} at ${incident.location}: ${incident.description}`,
+          tag: `eventpulse-${incident._id}`,
+          requireInteraction: true,
+        });
+      } catch { /* browser may revoke notification permission while the app is open */ }
+    }
+    const timeout = window.setTimeout(() => setActiveAlert(null), 15000);
+    return () => window.clearTimeout(timeout);
+  }, [incidents, permission, phoneEnabled, soundEnabled]);
+
+  const severityColor = activeAlert?.severity === "critical" ? "#b91c1c" : activeAlert?.severity === "high" ? "#c2410c" : "#a16207";
+  return (
+    <div className="absolute top-3 left-3 right-3 z-[45] pointer-events-none flex flex-col gap-2" aria-live="assertive">
+      <div className="pointer-events-auto rounded-2xl px-3 py-2.5 shadow-lg" style={{ background: "rgba(250,248,245,0.97)", border: `1px solid ${soundEnabled ? "rgba(16,185,129,0.35)" : "rgba(220,38,38,0.35)"}`, backdropFilter: "blur(14px)" }}>
+        <div className="flex items-center gap-2">
+          <span className="text-base" aria-hidden="true">{soundEnabled ? "🔔" : "🔕"}</span>
+          <div className="min-w-0 flex-1">
+            <p className="text-[11px] font-bold" style={{ color: ink }}>Staff emergency alerts</p>
+            <p className="text-[10px] leading-snug" style={{ color: muted }}>
+              {soundEnabled ? "Sound is armed for new incidents." : "Enable sound so this phone rings for new incidents."}
+              {phoneEnabled ? " Phone notifications are on." : ""}
+            </p>
+          </div>
+          {!soundEnabled && <button onClick={() => void enableAlerts()} className="shrink-0 rounded-xl px-3 py-2 text-[10px] font-bold text-white" style={{ background: "#dc2626" }}>Enable sound</button>}
+          {soundEnabled && <button onClick={() => void testSound()} className="shrink-0 rounded-xl px-2.5 py-2 text-[10px] font-semibold" style={{ background: "rgba(16,185,129,0.12)", color: "#047857" }}>Test sound</button>}
+          {soundEnabled && !phoneEnabled && permission !== "denied" && <button onClick={() => void enablePhoneNotifications()} className="shrink-0 rounded-xl px-2.5 py-2 text-[10px] font-semibold" style={{ background: "rgba(91,63,248,0.1)", color: accent }}>Enable phone</button>}
+        </div>
+        {soundEnabled && permission === "denied" && <p className="text-[10px] mt-1.5" style={{ color: "#b91c1c" }}>Phone notifications are blocked by the browser. Allow them in site settings; the in-app banner and sound remain active.</p>}
+      </div>
+      {activeAlert && (
+        <div className="pointer-events-auto rounded-2xl px-4 py-3 shadow-xl text-white" style={{ background: severityColor, border: "1px solid rgba(255,255,255,0.4)" }}>
+          <div className="flex items-start gap-3">
+            <span className="text-xl leading-none" aria-hidden="true">🚨</span>
+            <div className="min-w-0 flex-1">
+              <p className="text-[10px] font-mono font-bold tracking-widest">NEW {activeAlert.severity.toUpperCase()} INCIDENT · {activeAlert.incidentCode}</p>
+              <p className="text-sm font-bold mt-1">{activeAlert.location}</p>
+              <p className="text-xs mt-0.5 leading-snug">{activeAlert.description}</p>
+              <p className="text-[10px] mt-2 opacity-80">Staff response workflow has started. Check Command for assignment details.</p>
+            </div>
+            <button onClick={() => setActiveAlert(null)} className="text-white/80 text-lg leading-none" aria-label="Dismiss emergency alert">×</button>
+          </div>
+        </div>
+      )}
+      {lastAlertAt && !activeAlert && <span className="sr-only">Last new incident alert at {new Date(lastAlertAt).toLocaleTimeString()}</span>}
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Pannable Map
 // ─────────────────────────────────────────────────────────────────────────────
 function PannableMap({
   pins, onPin, approvedReports, pendingReports = [], headerContent, belowMapContent, allowPin, pois = [],
   onReportPinTap, pinpointMode, notifCount = 0, onNotifOpen, onPinpointToggle, mapUrl = null,
-  zones = [], responders = [],
+  zones = [], responders = [], publicRoutes = [],
 }: {
   mapUrl?: string | null;
   pins: Pin[];
@@ -631,6 +831,7 @@ function PannableMap({
   onPinpointToggle?: () => void;
   zones?: Array<{ _id: string; name: string; pinX: number; pinY: number; riskScore: number; currentOccupancy: number; capacity: number }>;
   responders?: Array<{ _id: string; name?: string; posX?: number; posY?: number; responderType: string; isAvailable: boolean }>;
+  publicRoutes?: Array<{ id: string; pathPoints: Array<{ x: number; y: number }> }>;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [offset, setOffset] = useState({ x: 0, y: 0 });
@@ -770,6 +971,9 @@ function PannableMap({
           }}
         >
           <img src={mapUrl ?? campusMap} alt={mapUrl ? "Event floor plan" : "IIT Delhi campus map"} style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} draggable={false} />
+          {publicRoutes.length > 0 && <svg className="absolute inset-0 h-full w-full pointer-events-none" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+            {publicRoutes.map(route => <polyline key={route.id} points={route.pathPoints.map(point => `${point.x},${point.y}`).join(" ")} fill="none" stroke="#047857" strokeWidth="0.8" strokeDasharray="1.4 0.9" strokeLinecap="round" strokeLinejoin="round" />)}
+          </svg>}
 
           {/* Approved report pins — clickable when not in pinpoint mode */}
           {approvedReports.map((r) => (
@@ -1729,7 +1933,7 @@ function FeedView({ reports, onView, trustScores, onResolve, seenIds, showSeen =
   onResolve?: (id: string) => void; seenIds?: Set<string>; showSeen?: boolean;
   notifications?: AppNotification[]; error?: string | null;
 }) {
-  const approved = [...reports.filter(isLiveReport)]
+  const approved = reports.filter(isLiveReport)
     .sort((a, b) => (PRIORITY_ORDER[a.priority ?? "low"] ?? 3) - (PRIORITY_ORDER[b.priority ?? "low"] ?? 3));
 
   return (
@@ -2692,10 +2896,12 @@ function StaffReportsView({ reports, onApprove, onReject, onBan, onSetPriority, 
 // Report Modal — description only
 // ─────────────────────────────────────────────────────────────────────────────
 function ReportModal({
+  eventId,
   onClose,
   onSubmit,
   pin,
 }: {
+  eventId: Id<"events">;
   onClose: () => void;
   onSubmit: (desc: string, loc: string, storageId?: Id<"_storage">, imgUrl?: string) => Promise<string | null>;
   pin: Pin | null;
@@ -2708,12 +2914,15 @@ function ReportModal({
   const [photoStorageId, setPhotoStorageId] = useState<Id<"_storage"> | undefined>(undefined);
   const [uploading, setUploading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const cameraInputRef = useRef<HTMLInputElement>(null);
   const generateUploadUrl = useMutation(api.files.generateUploadUrl);
+  const registerEvidence = useMutation(api.files.registerEvidence);
   const location = pin ? inferLocation(pin.x, pin.y) : "Pinned Location";
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    if (!["image/jpeg", "image/png", "image/webp"].includes(file.type) || file.size > 5 * 1024 * 1024) { setFailure("Choose a JPEG, PNG or WebP image up to 5 MB."); return; }
     try {
       setUploading(true);
       const postUrl = await generateUploadUrl();
@@ -2722,7 +2931,9 @@ function ReportModal({
         headers: { "Content-Type": file.type },
         body: file,
       });
+      if (!res.ok) throw new Error("Image upload failed. Try again.");
       const { storageId } = await res.json();
+      await registerEvidence({ eventId, storageId });
       setPhotoStorageId(storageId);
       setPhotoUrl(URL.createObjectURL(file));
     } catch (err: any) {
@@ -2741,9 +2952,9 @@ function ReportModal({
   const submit = async () => {
     if (!description.trim() || busy || uploading) return;
     setBusy(true);
-    const failed = await onSubmit(description, location, photoStorageId, photoUrl ?? undefined);
+    const failed = await onSubmit(description, location, photoStorageId, photoStorageId ? undefined : photoUrl ?? undefined);
     setBusy(false);
-    if (failed) { setFailure(failed); setSubmitted(true); return; }
+    if (failed) { setFailure(failed); return; }
     setSubmitted(true);
     setTimeout(onClose, 2000);
   };
@@ -2843,6 +3054,14 @@ function ReportModal({
                 onChange={handleFileUpload}
                 className="hidden"
               />
+              <input
+                type="file"
+                ref={cameraInputRef}
+                accept="image/*"
+                capture="environment"
+                onChange={handleFileUpload}
+                className="hidden"
+              />
 
               {photoUrl ? (
                 <div className="relative rounded-xl overflow-hidden border border-slate-300 bg-slate-900">
@@ -2859,15 +3078,29 @@ function ReportModal({
                   </button>
                 </div>
               ) : (
-                <button
-                  type="button"
-                  onClick={() => fileInputRef.current?.click()}
-                  disabled={uploading}
-                  className="w-full py-2.5 px-3 rounded-xl border border-dashed border-slate-400 bg-white hover:bg-slate-50 flex items-center justify-center gap-2 text-xs text-slate-700 transition cursor-pointer"
-                >
-                  <span>📷</span>
-                  <span>{uploading ? "Uploading Photo..." : "Attach Incident Photo (Camera / File)"}</span>
-                </button>
+                <div className="space-y-2">
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => cameraInputRef.current?.click()}
+                      disabled={uploading}
+                      className="py-3 px-2 rounded-xl border border-red-200 bg-red-50 hover:bg-red-100 flex items-center justify-center gap-1.5 text-xs font-semibold text-red-800 transition cursor-pointer disabled:opacity-50"
+                    >
+                      <span aria-hidden="true">📸</span>
+                      <span>Take live photo</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => fileInputRef.current?.click()}
+                      disabled={uploading}
+                      className="py-3 px-2 rounded-xl border border-slate-300 bg-white hover:bg-slate-50 flex items-center justify-center gap-1.5 text-xs font-semibold text-slate-700 transition cursor-pointer disabled:opacity-50"
+                    >
+                      <span aria-hidden="true">🖼️</span>
+                      <span>Choose photo</span>
+                    </button>
+                  </div>
+                  <p className="text-[10px] text-center text-slate-500">Take a new image directly in this browser, or attach one already on the device.</p>
+                </div>
               )}
             </div>
 
@@ -2966,7 +3199,7 @@ const POI_EMOJIS = [
   "⛺","🏕️","🌳","🌿","💐","🐾","🎯","🎲","♟️","🧩","🪁","🎳",
 ];
 
-function POIModal({ onClose, onAdd, pin }: { onClose: () => void; onAdd: (emoji: string, label: string) => void; pin: Pin }) {
+function POIModal({ onClose, onAdd }: { onClose: () => void; onAdd: (emoji: string, label: string) => void; pin: Pin }) {
   const [emoji, setEmoji] = useState("📍");
   const [label, setLabel] = useState("");
   const submit = () => { if (label.trim()) { onAdd(emoji, label.trim()); } };
@@ -3064,6 +3297,11 @@ export default function App() {
   const poiRows = useQuery(api.mapPins.listForEvent, activeEventId ? { eventId: activeEventId } : "skip");
   const liveZones = useQuery(api.agents.queries.listZonesWithRisk, activeEventId && isModerator ? { eventId: activeEventId } : "skip");
   const liveResponders = useQuery(api.agents.queries.listResponders, activeEventId && isModerator ? { eventId: activeEventId } : "skip");
+  // This is a reactive Convex query. A staff phone therefore receives the
+  // alert as soon as intake creates the incident, without polling.
+  const incidentRows = useQuery(api.agents.queries.listIncidents, activeEventId && isModerator ? { eventId: activeEventId } : "skip");
+  const routeNow = useNowAtBoundaries([]);
+  const publicRoutes = useQuery(api.agents.queries.listPublicRoutes, activeEventId ? { eventId: activeEventId, now: routeNow } : "skip");
 
   const createEventMutation = useMutation(api.events.create);
   const updateFloorMapMutation = useMutation(api.events.updateFloorMap);
@@ -3367,6 +3605,8 @@ export default function App() {
     setEventData({ attendeeCode: MOCK_ATTENDEE_CODE, staffCode: MOCK_STAFF_CODE, staff: [] });
   };
 
+  const reportRetryRef = useRef<{ payload: string; clientId: string } | null>(null);
+
   /** Returns an error message, or null when the report was filed. */
   const handleReport = async (
     desc: string,
@@ -3379,15 +3619,18 @@ export default function App() {
     try {
       // One UUID per submission: a retry re-sends it and the server returns the
       // report it already wrote instead of filing a second one.
+      const payload = JSON.stringify([activeEventId,desc,storageId,imgUrl,pin.x,pin.y]);
+      if (reportRetryRef.current?.payload !== payload) reportRetryRef.current = { payload, clientId: crypto.randomUUID() };
       await createReportMutation({
         eventId: activeEventId,
-        clientId: crypto.randomUUID(),
+        clientId: reportRetryRef.current.clientId,
         description: desc,
         pinX: pin.x,
         pinY: pin.y,
         imageStorageId: storageId,
         imageUrl: imgUrl,
       });
+      reportRetryRef.current = null;
       setPins([]);
       setPinpointMode(false);
       setStaffPinpointMode(false);
@@ -3505,6 +3748,7 @@ export default function App() {
                   approvedReports={approvedReports}
                   allowPin={pinpointMode}
                   pois={pois}
+                  publicRoutes={publicRoutes ?? []}
                   pinpointMode={pinpointMode}
                   onPinpointToggle={() => { setPinpointMode((v) => !v); setPins([]); }}
                   onReportPinTap={(id) => { setSelectedReportId(id); }}
@@ -3521,7 +3765,7 @@ export default function App() {
                         </div>
                       )}
                       {/* Non-pinpoint hint */}
-                      {!pinpointMode && !pins.length && (
+                      {!pinpointMode && !pins.length && !publicRoutes?.length && (
                         <div className="absolute left-4 right-4 pointer-events-none"
                           style={{ bottom: 92, background: "rgba(255,255,255,0.88)", backdropFilter: "blur(10px)", borderRadius: 14, padding: "10px 16px", border: `1px solid ${border}` }}>
                           <p className="text-xs text-center font-medium flex items-center justify-center gap-1" style={{ color: "#6b6456" }}>
@@ -3530,6 +3774,14 @@ export default function App() {
                           <span>button to report</span>
                         </p>
                         </div>
+                      )}
+                      {!pinpointMode && !pins.length && publicRoutes && publicRoutes.length > 0 && (
+                        <section className="absolute z-20 left-4 right-4 max-h-48 overflow-y-auto rounded-md border border-emerald-700 bg-white/95 p-3 shadow-lg" style={{ bottom: 92 }} aria-label="Approved crowd guidance">
+                          <h2 className="text-xs font-bold text-emerald-900">Approved crowd guidance</h2>
+                          {publicRoutes.map(route => <p key={route.id} className="mt-1 text-xs leading-snug text-[#2e2a24]">
+                            <strong>{route.affectedZone}:</strong> {route.pathNames.join(" → ")} · up to {route.plannedPeople} people in this wave. Move only when staff directs your group.
+                          </p>)}
+                        </section>
                       )}
                       {pins.length > 0 && (
                         <div className="absolute left-0 right-0 flex justify-center gap-2.5" style={{ bottom: 92 }}>
@@ -3589,6 +3841,7 @@ export default function App() {
             </aside>
             {showReport && (
               <ReportModal
+                eventId={activeEventId!}
                 onClose={() => {
                   setShowReport(false);
                   setPins([]);
@@ -3617,6 +3870,7 @@ export default function App() {
           // Same shell as the attendee workspace; the laptop panel is the
           // reports queue.
           <div className="flex-1 flex flex-col min-h-0 relative lg:flex-row lg:gap-6 lg:p-6">
+            <StaffEmergencyAlerts incidents={(incidentRows ?? []) as IncidentAlertRow[]} />
             <SideNav items={staffNav.filter((i) => i.id !== "reports")} active={staffTab} onChange={setStaffTab} />
             <div className={`flex-1 flex flex-col min-h-0 relative sm:p-6 lg:p-0 ${staffTab === "command" ? "lg:flex-1" : "lg:flex-none lg:aspect-[390/811.5]"}`}>
             {staffTab === "command" && (
@@ -3802,6 +4056,7 @@ export default function App() {
             )}
             {showReport && (
               <ReportModal
+                eventId={activeEventId!}
                 onClose={() => {
                   setShowReport(false);
                   setPins([]);

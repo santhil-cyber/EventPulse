@@ -4,6 +4,8 @@ import { internalMutation, internalQuery, type MutationCtx } from "../_generated
 import { logAgentAction } from "../lib/agentLog";
 import { canMarkVerified, shouldAlertNearbyStaff } from "../lib/safety";
 import { THRESHOLDS } from "../lib/verificationThresholds";
+import { ACTIVE_TASKS, rankResponders } from "../lib/dispatchPolicy";
+import { executeAssignResponder } from "./dispatch";
 import { verificationStatusValidator } from "../schema";
 
 /** Tool: Check source independence and reporter trust */
@@ -22,11 +24,11 @@ export const check_source_independence = internalQuery({
     const reports: Doc<"reports">[] = [];
     for (const rId of reportIds) {
       const rep = await ctx.db.get("reports", rId);
-      if (rep) reports.push(rep);
+      if (rep && rep.eventId === incident.eventId && rep.status !== "rejected") reports.push(rep);
     }
 
     const reporterUserIds = Array.from(new Set(reports.map((r) => r.reporterId)));
-    const independentCount = reporterUserIds.length;
+    const eligibleReporterIds = [];
 
     let totalTrust = 0;
     let validCount = 0;
@@ -37,13 +39,14 @@ export const check_source_independence = internalQuery({
           q.eq("eventId", incident.eventId).eq("userId", uId),
         )
         .unique();
-      if (membership) {
+      if (membership && !membership.isBanned) {
+        eligibleReporterIds.push(uId);
         totalTrust += membership.trustScore;
         validCount++;
       }
     }
 
-    const avgTrustScore = validCount > 0 ? Math.round(totalTrust / validCount) : 50;
+    const avgTrustScore = validCount > 0 ? Math.round(totalTrust / validCount) : 0;
 
     let hasDuplicateMedia = false;
     for (let i = 0; i < reports.length; i++) {
@@ -59,8 +62,8 @@ export const check_source_independence = internalQuery({
     }
 
     return {
-      independentCount,
-      uniqueReporterIds: reporterUserIds,
+      independentCount: eligibleReporterIds.length,
+      uniqueReporterIds: eligibleReporterIds,
       avgTrustScore,
       hasDuplicateMedia,
       reportCount: reports.length,
@@ -108,73 +111,20 @@ export async function executeRequestStaffVerification(
   const incident = await ctx.db.get("incidents", args.incidentId);
   if (!incident) throw new Error("Incident not found");
 
-  const responders = await ctx.db
-    .query("responders")
-    .withIndex("by_event_available", (q) =>
-      q.eq("eventId", args.eventId).eq("isAvailable", true),
-    )
-    .take(20);
-
-  let assignedResponder: Doc<"responders"> | null = null;
-  let minDistance = Infinity;
-
-  for (const resp of responders) {
-    const dist = Math.hypot(
-      (resp.posX ?? 50) - incident.pinX,
-      (resp.posY ?? 50) - incident.pinY,
-    );
-    if (dist < minDistance) {
-      minDistance = dist;
-      assignedResponder = resp;
-    }
+  if (incident.eventId !== args.eventId || incident.isResolved) return false;
+  if (incident.staffVerificationRequested) return true;
+  const responders = await ctx.db.query("responders").withIndex("by_event_available", q => q.eq("eventId", args.eventId).eq("isAvailable", true)).take(100);
+  const eligible = [];
+  for (const responder of responders) {
+    const member = await ctx.db.get("memberships", responder.membershipId);
+    if (responder.currentTaskId || !member || member.eventId !== args.eventId || member.userId !== responder.userId || member.isBanned || member.role === "ATTENDEE") continue;
+    eligible.push(responder);
   }
-
-  await ctx.db.patch("incidents", incident._id, {
-    staffVerificationRequested: true,
-    updatedAt: Date.now(),
-  });
-
-  if (assignedResponder) {
-    const taskId = await ctx.db.insert("dispatchTasks", {
-      eventId: args.eventId,
-      incidentId: incident._id,
-      responderId: assignedResponder._id,
-      instruction: `Physical verification requested: Confirm incident at ${incident.location} (${incident.incidentCode})`,
-      status: "pending",
-      estimatedEta: Math.round(minDistance * 4),
-      distanceMeters: Math.round(minDistance * 10),
-      assignedAt: Date.now(),
-      isEmergencyDispatch: false,
-    });
-
-    await ctx.db.patch("responders", assignedResponder._id, {
-      isAvailable: false,
-      currentTaskId: taskId,
-      updatedAt: Date.now(),
-    });
-
-    await logAgentAction(
-      ctx,
-      args.eventId,
-      "verification",
-      "request_staff_verification",
-      `Incident ${incident.incidentCode} at ${incident.location}`,
-      `Dispatched responder ${assignedResponder.name ?? assignedResponder.responderType} for eyes-on-ground verification`,
-      "action",
-      incident._id,
-    );
-  } else {
-    await logAgentAction(
-      ctx,
-      args.eventId,
-      "verification",
-      "request_staff_verification",
-      `Incident ${incident.incidentCode} at ${incident.location}`,
-      "Staff verification requested (awaiting available responder)",
-      "warn",
-      incident._id,
-    );
-  }
+  const ranked = rankResponders(eligible, incident, {}, false);
+  const assigned = Boolean(ranked[0]);
+  if (ranked[0]) await executeAssignResponder(ctx, { responderId: ranked[0]._id, incidentId: incident._id, purpose: "verification", instruction: `Physical verification requested at ${incident.location} (${incident.incidentCode}).` });
+  await ctx.db.patch("incidents", incident._id, { staffVerificationRequested: assigned, updatedAt: Date.now() });
+  await logAgentAction(ctx, args.eventId, "verification", "request_staff_verification", incident.incidentCode, assigned ? "Staff assessment task assigned; awaiting acknowledgment." : "No available staff. Immediate operator assessment required.", assigned ? "action" : "warn", incident._id);
 
   return true;
 }
@@ -200,6 +150,11 @@ export async function executeUpdateVerificationStatus(
 ): Promise<"UNVERIFIED" | "CORROBORATED" | "VERIFIED"> {
   const incident = await ctx.db.get("incidents", args.incidentId);
   if (!incident) throw new Error("Incident not found");
+  if (args.newStatus === "VERIFIED") {
+    const threshold = THRESHOLDS[incident.incidentType] ?? THRESHOLDS.other;
+    const check = canMarkVerified(incident, threshold, incident.averageTrustScore ?? 0);
+    if (!check.allowed) throw new Error(check.reason);
+  }
 
   const previousStatus = incident.verificationStatus;
   await ctx.db.patch("incidents", incident._id, {
@@ -253,34 +208,17 @@ export const evaluateIncident = internalMutation({
       if (rep) reports.push(rep);
     }
 
-    const reporterUserIds = Array.from(new Set(reports.map((r) => r.reporterId)));
-    const independentCount = reporterUserIds.length;
-
+    if (incident.isResolved) return { previousStatus: incident.verificationStatus, newStatus: incident.verificationStatus, independentCount: 0, avgTrustScore: 0 };
+    const reporterUserIds = Array.from(new Set(reports.filter(r => r.eventId === incident.eventId && r.status !== "rejected").map(r => r.reporterId)));
     let totalTrust = 0;
-    let validCount = 0;
+    let independentCount = 0;
     for (const uId of reporterUserIds) {
-      const membership = await ctx.db
-        .query("memberships")
-        .withIndex("by_event_user", (q) =>
-          q.eq("eventId", incident.eventId).eq("userId", uId),
-        )
-        .unique();
-      if (membership) {
-        totalTrust += membership.trustScore;
-        validCount++;
-      }
+      const membership = await ctx.db.query("memberships").withIndex("by_event_user", q => q.eq("eventId", incident.eventId).eq("userId", uId)).unique();
+      if (membership && !membership.isBanned) { totalTrust += membership.trustScore; independentCount++; }
     }
-    const avgTrustScore = validCount > 0 ? Math.round(totalTrust / validCount) : 55;
-    const hasImageEvidence = Boolean(
-      incident.hasImageEvidence || reports.some((r) => r.imageUrl || r.imageStorageId),
-    );
-
-    await ctx.db.patch("incidents", incident._id, {
-      independentSourceCount: independentCount,
-      averageTrustScore: avgTrustScore,
-      hasImageEvidence,
-      updatedAt: Date.now(),
-    });
+    const avgTrustScore = independentCount > 0 ? Math.round(totalTrust / independentCount) : 0;
+    const hasImageEvidence = reports.some(r => r.status !== "rejected" && Boolean(r.imageStorageId || r.imageUrl));
+    await ctx.db.patch("incidents", incident._id, { independentSourceCount: independentCount, averageTrustScore: avgTrustScore, hasImageEvidence, updatedAt: Date.now() });
 
     const threshold = THRESHOLDS[incident.incidentType] ?? THRESHOLDS.other;
     const canVerify = canMarkVerified(
@@ -289,23 +227,13 @@ export const evaluateIncident = internalMutation({
       avgTrustScore,
     );
 
-    let newStatus: "UNVERIFIED" | "CORROBORATED" | "VERIFIED" = incident.verificationStatus;
-    let reason = incident.verificationReason ?? "";
-
-    if (canVerify.allowed) {
-      newStatus = "VERIFIED";
-      reason = canVerify.reason;
-    } else if (hasImageEvidence && (avgTrustScore >= 80 || independentCount >= 2)) {
-      // Multi-modal verification: High trust score + visual evidence reaches VERIFIED threshold
-      newStatus = "VERIFIED";
-      reason = `Multi-modal verification: Visual evidence validated (CV conf ${incident.imageConfidence ?? 92}%) with high source trust (${avgTrustScore}/100)`;
-    } else if (hasImageEvidence || independentCount >= 2 || (independentCount === 1 && avgTrustScore >= 70)) {
-      if (incident.verificationStatus === "UNVERIFIED") {
-        newStatus = "CORROBORATED";
-        reason = hasImageEvidence
-          ? `Visual evidence validated (CV conf ${incident.imageConfidence ?? 92}%) with reporter trust ${avgTrustScore}/100`
-          : `${independentCount} independent source(s) detected with avg trust ${avgTrustScore}`;
-      }
+    // Attachment presence and model opinions never bypass source/staff policy.
+    let newStatus: "UNVERIFIED" | "CORROBORATED" | "VERIFIED" = "UNVERIFIED";
+    let reason = canVerify.reason;
+    if (canVerify.allowed) { newStatus = "VERIFIED"; }
+    else if (independentCount >= 2 || (independentCount === 1 && avgTrustScore >= 70)) {
+      newStatus = "CORROBORATED";
+      reason = `${independentCount} eligible source account(s), average trust ${avgTrustScore}; staff confirmation may still be required.`;
     }
 
     await logAgentAction(
@@ -319,6 +247,31 @@ export const evaluateIncident = internalMutation({
       incident._id,
     );
 
+    if (newStatus !== incident.verificationStatus && newStatus !== "VERIFIED") {
+      const routes = await ctx.db.query("routeRecommendations").withIndex("by_incident", q => q.eq("incidentId", incident._id)).take(100);
+      for (const route of routes) if (route.isActive) await ctx.db.patch("routeRecommendations", route._id, { isActive: false });
+      if (newStatus === "UNVERIFIED") {
+        const tasks = await ctx.db.query("dispatchTasks").withIndex("by_incident", q => q.eq("incidentId", incident._id)).take(100);
+        for (const task of tasks) {
+          if ((task.purpose ?? "response") !== "response" || !ACTIVE_TASKS.has(task.status)) continue;
+          await ctx.db.patch("dispatchTasks", task._id, { status: "canceled", completedAt: Date.now() });
+          const responder = await ctx.db.get("responders", task.responderId);
+          if (responder?.currentTaskId === task._id) await ctx.db.patch("responders", responder._id, { isAvailable: true, currentTaskId: undefined, updatedAt: Date.now() });
+        }
+      }
+    }
+
+    if (newStatus === "VERIFIED") {
+      // Assessment is finished. Release its reservation before response dispatch.
+      const tasks = await ctx.db.query("dispatchTasks").withIndex("by_incident", q => q.eq("incidentId", incident._id)).take(100);
+      for (const task of tasks) {
+        if (task.purpose !== "verification" || !ACTIVE_TASKS.has(task.status)) continue;
+        await ctx.db.patch("dispatchTasks", task._id, { status: "completed", completedAt: Date.now() });
+        const responder = await ctx.db.get("responders", task.responderId);
+        if (responder?.currentTaskId === task._id) await ctx.db.patch("responders", responder._id, { isAvailable: true, currentTaskId: undefined, updatedAt: Date.now() });
+      }
+    }
+
     if (newStatus !== incident.verificationStatus) {
       await executeUpdateVerificationStatus(ctx, {
         incidentId: incident._id,
@@ -328,7 +281,7 @@ export const evaluateIncident = internalMutation({
     }
 
     if (
-      shouldAlertNearbyStaff(newStatus, incident.severity) &&
+      (shouldAlertNearbyStaff(newStatus, incident.severity) || (newStatus !== "VERIFIED" && (incident.severity === "high" || incident.severity === "critical"))) &&
       !incident.staffVerificationRequested
     ) {
       await executeRequestStaffVerification(ctx, {
